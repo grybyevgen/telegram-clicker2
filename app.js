@@ -374,8 +374,14 @@ function generateReferralLink() {
     // В режиме разработки - локальная ссылка с параметром
     return `${window.location.origin}${window.location.pathname}?ref=${userId}`;
   } else {
-    // В Telegram - ссылка на бота с параметром start
-    return `https://t.me/your_bot?start=ref_${userId}`;
+    // В Telegram - генерируем ссылку на бота
+    // Нужно заменить 'your_bot' на реальное имя вашего бота
+    // Или получить его из конфигурации
+    const botUsername = 'your_bot'; // TODO: Замените на имя вашего бота
+    
+    // Используем формат для Telegram Bot с параметром start
+    // Параметр start будет доступен в initDataUnsafe.start_param
+    return `https://t.me/${botUsername}?start=ref_${userId}`;
   }
 }
 
@@ -443,25 +449,70 @@ function setupCopyLinkButton() {
   });
 }
 
-// Обработка реферального параметра из URL
+// Обработка реферального параметра из URL или Telegram start_param
 async function processReferralParam() {
-  const urlParams = new URLSearchParams(window.location.search);
-  const refId = urlParams.get('ref');
+  if (!window.userData || !window.db) return;
   
-  if (!refId || !window.userData || !window.db) return;
+  let refId = null;
+  
+  // Проверяем start_param из Telegram (для продакшена)
+  // Согласно документации, start_param находится в initDataUnsafe
+  const tg = getTelegramWebApp();
+  if (tg && tg.initDataUnsafe && tg.initDataUnsafe.start_param) {
+    const startParam = tg.initDataUnsafe.start_param;
+    
+    if (startParam && startParam.startsWith('ref_')) {
+      refId = startParam.replace('ref_', '');
+      console.log('✅ Реферальный параметр найден в Telegram start_param:', refId);
+    }
+  }
+  
+  // Проверяем параметр из URL (для режима разработки или fallback)
+  if (!refId) {
+    const urlParams = new URLSearchParams(window.location.search);
+    refId = urlParams.get('ref');
+    if (refId) {
+      console.log('Реферальный параметр найден в URL:', refId);
+    }
+  }
+  
+  // Также проверяем tgWebAppStartParam из URL (Telegram может передавать параметр в URL)
+  if (!refId) {
+    const urlParams = new URLSearchParams(window.location.search);
+    const tgStartParam = urlParams.get('tgWebAppStartParam');
+    if (tgStartParam && tgStartParam.startsWith('ref_')) {
+      refId = tgStartParam.replace('ref_', '');
+      console.log('Реферальный параметр найден в tgWebAppStartParam:', refId);
+    }
+  }
+  
+  if (!refId) {
+    console.log('Реферальный параметр не найден');
+    return;
+  }
   
   // Нельзя пригласить себя
-  if (refId === window.userData.userId) return;
+  if (refId === window.userData.userId) {
+    console.log('Пользователь пытается пригласить себя');
+    return;
+  }
   
   // Проверяем, не приглашал ли уже кто-то этого пользователя
   if (window.userData.invitedBy) {
-    console.log('Пользователь уже приглашен кем-то другим');
+    console.log('Пользователь уже приглашен кем-то другим:', window.userData.invitedBy);
     return;
   }
   
   console.log(`Обработка реферальной ссылки от: ${refId}`);
   
   try {
+    // Проверяем, существует ли приглашающий пользователь
+    const inviterDoc = await window.db.collection('users').doc(refId).get();
+    if (!inviterDoc.exists) {
+      console.log('Приглашающий пользователь не найден в базе данных');
+      return;
+    }
+    
     // 1. Записываем кто пригласил
     await window.db.collection('users').doc(window.userData.userId).update({
       invitedBy: refId
@@ -480,7 +531,10 @@ async function processReferralParam() {
       referralsEarned: firebase.firestore.FieldValue.increment(10)
     });
     
-    console.log('Реферал успешно зарегистрирован! Бонус 10 монет начислен.');
+    console.log('✅ Реферал успешно зарегистрирован! Бонус 10 монет начислен приглашающему.');
+    
+    // Обновляем UI рефералов
+    updateReferralsUI();
     
   } catch (error) {
     console.error('Ошибка обработки реферала:', error);
@@ -983,14 +1037,34 @@ function initFirebase() {
 
 // Функция проверки, запущено ли приложение в Telegram
 function isTelegramWebApp() {
-    return window.Telegram && 
-           window.Telegram.WebApp && 
-           window.Telegram.WebApp.initDataUnsafe && 
-           window.Telegram.WebApp.initDataUnsafe.user;
+    // Проверяем наличие Telegram Web App API
+    if (!window.Telegram || !window.Telegram.WebApp) {
+        return false;
+    }
+    
+    const tg = window.Telegram.WebApp;
+    
+    // Проверяем, что мы действительно в Telegram (не в обычном браузере)
+    // В Telegram всегда есть platform, и он не равен 'unknown'
+    if (tg.platform && tg.platform !== 'unknown' && tg.platform !== 'web') {
+        return true;
+    }
+    
+    // Дополнительная проверка: если есть initDataUnsafe, значит мы в Telegram
+    if (tg.initDataUnsafe) {
+        return true;
+    }
+    
+    return false;
 }
 
-// Инициализация Telegram Web App
-const tg = window.Telegram?.WebApp;
+// Функция получения экземпляра Telegram Web App
+function getTelegramWebApp() {
+    if (window.Telegram && window.Telegram.WebApp) {
+        return window.Telegram.WebApp;
+    }
+    return null;
+}
 
 // Элементы DOM
 const loadingEl = document.getElementById('loading');
@@ -1039,22 +1113,67 @@ async function loadUserData() {
         window.isDevMode = false;
         hideDevModeIndicator();
         
-        const tg = window.Telegram.WebApp;
+        const tg = getTelegramWebApp();
+        if (!tg) {
+            console.error("Ошибка: Telegram WebApp недоступен");
+            showError('Ошибка: Telegram WebApp недоступен');
+            return;
+        }
+        
+        // Инициализируем Telegram Web App (ready() уже вызван в initApp, но для надежности вызываем еще раз)
         tg.ready();
         tg.expand();
         
-        const tgUser = tg.initDataUnsafe.user;
-        if (tgUser) {
+        // Получаем данные пользователя из initDataUnsafe
+        // Это единственный правильный способ согласно документации Telegram
+        let tgUser = null;
+        
+        if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+            tgUser = tg.initDataUnsafe.user;
+        }
+        
+        // Если данные пользователя еще не загружены, ждем немного
+        if (!tgUser) {
+            console.warn("Данные пользователя Telegram еще не загружены, ждем...");
+            
+            // Ждем до 2 секунд для загрузки данных
+            let attempts = 0;
+            while (attempts < 20 && !tgUser) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+                if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
+                    tgUser = tg.initDataUnsafe.user;
+                    break;
+                }
+                attempts++;
+            }
+        }
+        
+        if (tgUser && tgUser.id) {
             userInfo = {
                 userId: tgUser.id.toString(),
                 firstName: tgUser.first_name || 'Пользователь',
                 username: tgUser.username || '',
-                photoUrl: tgUser.photo_url || ''
+                photoUrl: tgUser.photo_url || '',
+                lastName: tgUser.last_name || '',
+                languageCode: tgUser.language_code || 'ru'
             };
             console.log("✅ Запуск в Telegram, пользователь:", userInfo);
+            console.log("Telegram WebApp данные:", {
+                platform: tg.platform,
+                version: tg.version,
+                colorScheme: tg.colorScheme,
+                initDataUnsafe: {
+                    query_id: tg.initDataUnsafe.query_id,
+                    auth_date: tg.initDataUnsafe.auth_date,
+                    hash: tg.initDataUnsafe.hash ? 'present' : 'missing',
+                    start_param: tg.initDataUnsafe.start_param
+                }
+            });
         } else {
-            console.error("Данные пользователя Telegram не найдены");
-            showError('Ошибка: данные пользователя Telegram не найдены');
+            console.error("❌ Не удалось получить данные пользователя Telegram");
+            console.log("Доступные данные initDataUnsafe:", tg.initDataUnsafe);
+            console.log("Платформа:", tg.platform);
+            showError('Ошибка: не удалось получить данные пользователя Telegram. Попробуйте перезапустить приложение.');
             return;
         }
     } else {
@@ -1077,6 +1196,19 @@ async function loadUserData() {
         
         if (userDoc.exists) {
             window.userData = userDoc.data();
+            
+            // Обновляем userId если его нет (для старых записей)
+            if (!window.userData.userId) {
+                window.userData.userId = userInfo.userId;
+            }
+            
+            // Обновляем имя и username если они изменились
+            if (userInfo.firstName && window.userData.firstName !== userInfo.firstName) {
+                window.userData.firstName = userInfo.firstName;
+            }
+            if (userInfo.username && window.userData.username !== userInfo.username) {
+                window.userData.username = userInfo.username;
+            }
             
             // Инициализируем upgrades если отсутствует
             if (!window.userData.upgrades) {
@@ -1137,7 +1269,10 @@ async function loadUserData() {
             window.userData.energy = Math.floor(window.userData.energy || 0);
             
             // Обновляем в Firestore если значения изменились
-            await userRef.update({
+            const updateData = {
+                userId: window.userData.userId,
+                firstName: window.userData.firstName,
+                username: window.userData.username,
                 perClickValue: window.userData.perClickValue,
                 passiveIncome: window.userData.passiveIncome,
                 upgrades: window.userData.upgrades,
@@ -1151,8 +1286,11 @@ async function loadUserData() {
                 totalEarned: window.userData.totalEarned,
                 weeklyEarned: window.userData.weeklyEarned,
                 leaderboardVisible: window.userData.leaderboardVisible,
-                lastWeeklyReset: window.userData.lastWeeklyReset
-            });
+                lastWeeklyReset: window.userData.lastWeeklyReset,
+                lastActive: firebase.firestore.FieldValue.serverTimestamp()
+            };
+            
+            await userRef.update(updateData);
             
             updateUI();
             renderShop(); // Обновляем магазин после загрузки данных
@@ -1173,8 +1311,13 @@ async function loadUserData() {
             console.log("User data set:", window.userData);
         } else {
             // Новый пользователь - создаем запись
+            console.log("🆕 Создание нового пользователя:", userInfo);
+            
             window.userData = { 
-                ...userInfo, 
+                userId: userInfo.userId,
+                firstName: userInfo.firstName,
+                username: userInfo.username,
+                photoUrl: userInfo.photoUrl || '',
                 balance: 0, 
                 totalClicks: 0, 
                 perClickValue: 1, 
@@ -1188,16 +1331,22 @@ async function loadUserData() {
                 energyPerHour: 100,
                 totalEarned: 0,
                 weeklyEarned: 0,
-                leaderboardVisible: true
+                leaderboardVisible: true,
+                lastEnergyUpdate: firebase.firestore.FieldValue.serverTimestamp(),
+                lastWeeklyReset: firebase.firestore.FieldValue.serverTimestamp(),
+                createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+                lastActive: firebase.firestore.FieldValue.serverTimestamp()
             };
             
             // Пересчитываем статистику (для нового пользователя будет базовое значение)
             recalculateStats();
             
+            // Создаем запись в базе данных
             await userRef.set({
                 userId: userInfo.userId,
                 firstName: userInfo.firstName,
-                username: userInfo.username,
+                username: userInfo.username || '',
+                photoUrl: userInfo.photoUrl || '',
                 balance: 0,
                 totalClicks: 0,
                 perClickValue: window.userData.perClickValue,
@@ -1217,6 +1366,8 @@ async function loadUserData() {
                 createdAt: firebase.firestore.FieldValue.serverTimestamp(),
                 lastActive: firebase.firestore.FieldValue.serverTimestamp()
             });
+            
+            console.log("✅ Новый пользователь создан в базе данных:", userInfo.userId);
             
             updateUI();
             renderShop(); // Обновляем магазин после создания нового пользователя
@@ -1409,8 +1560,15 @@ async function handleClick() {
         updateUI();
         
         // Вибрация при клике (только в Telegram, не в режиме разработки)
-        if (!window.isDevMode && tg && tg.HapticFeedback) {
-            tg.HapticFeedback.impactOccurred('light');
+        if (!window.isDevMode) {
+            const tg = getTelegramWebApp();
+            if (tg && tg.HapticFeedback) {
+                try {
+                    tg.HapticFeedback.impactOccurred('light');
+                } catch (error) {
+                    console.warn('Ошибка вибрации:', error);
+                }
+            }
         }
         
         console.log(`handleClick: Клик выполнен! Баланс: ${window.userData.balance}, Кликов: ${window.userData.totalClicks}, Энергия: ${window.userData.energy}`);
@@ -1482,20 +1640,56 @@ async function initApp() {
             return;
         }
         
-        // 2. Определяем режим работы
-        if (window.isDevMode) {
-            showDevModeIndicator();
-            console.log('Режим: разработки');
+        // 2. Инициализация Telegram Web App (если доступен)
+        // Важно: инициализация должна происходить ДО загрузки данных пользователя
+        const tg = getTelegramWebApp();
+        if (tg) {
+            // Вызываем ready() - это обязательный метод для инициализации
+            tg.ready();
+            
+            // Разворачиваем приложение на весь экран
+            tg.expand();
+            
+            // Настраиваем тему Telegram
+            if (tg.colorScheme) {
+                document.documentElement.setAttribute('data-theme', tg.colorScheme);
+                // Также можно установить цвет фона
+                if (tg.backgroundColor) {
+                    document.body.style.backgroundColor = tg.backgroundColor;
+                }
+            }
+            
+            // Обработчик изменения темы
+            tg.onEvent('themeChanged', () => {
+                if (tg.colorScheme) {
+                    document.documentElement.setAttribute('data-theme', tg.colorScheme);
+                }
+                if (tg.backgroundColor) {
+                    document.body.style.backgroundColor = tg.backgroundColor;
+                }
+            });
+            
+            // Обработчик изменения размера окна
+            tg.onEvent('viewportChanged', () => {
+                // Можно обработать изменение размера окна
+                console.log('Viewport changed:', tg.viewportHeight);
+            });
+            
+            // Включаем вибрацию при клике (если поддерживается)
+            if (tg.HapticFeedback) {
+                // Будет использоваться в handleClick
+            }
+            
+            console.log('✅ Telegram WebApp инициализирован');
+            console.log('Платформа:', tg.platform);
+            console.log('Версия:', tg.version);
+            console.log('Цветовая схема:', tg.colorScheme);
+            console.log('Высота viewport:', tg.viewportHeight);
         } else {
-            hideDevModeIndicator();
-            console.log('Режим: Telegram');
+            console.log('⚠️ Telegram WebApp не обнаружен - режим разработки');
         }
         
-        // 3. Инициализация Telegram Web App (только если не режим разработки)
-        if (!window.isDevMode && tg) {
-            tg.expand();
-            tg.ready();
-        }
+        // 3. Режим работы определится в loadUserData()
         
         // 4. Загрузка данных пользователя (после инициализации Firebase)
         await loadUserData();
