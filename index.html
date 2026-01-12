@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Clicker</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore-compat.js"></script>
+</head>
+<body>
+    <!-- Прелоадер -->
+    <div id="preloader" style="position:fixed;top:0;left:0;width:100%;height:100%;background:white;z-index:9999;display:flex;flex-direction:column;align-items:center;justify-content:center;">
+        <h2>Загрузка кликера...</h2>
+        <div id="load-status">Проверка зависимостей</div>
+    </div>
+    <div id="devModeIndicator" class="dev-mode-indicator" style="display: none;">
+        Режим разработки
+    </div>
+    <div id="app">
+        <h1>Telegram Clicker</h1>
+        <div id="loading" class="loading">Загрузка...</div>
+        <div id="content" class="content" style="display: none;">
+            <!-- НАВИГАЦИОННОЕ МЕНЮ -->
+            <nav class="navigation">
+                <button class="nav-btn active" data-tab="main-tab">Главная</button>
+                <button class="nav-btn" data-tab="shop-tab">Магазин</button>
+                <button class="nav-btn" data-tab="referrals-tab">Рефералы</button>
+                <button class="nav-btn" data-tab="leaderboard-tab">🏆 Рейтинг</button>
+            </nav>
+            
+            <!-- КОНТЕЙНЕР ДЛЯ ВКЛАДОК -->
+            <div class="tabs-container">
+                <!-- Главная вкладка (кликер) -->
+                <div id="main-tab" class="tab-content" style="display: block;">
+                    <div class="stats">
+                        <div id="balance" class="balance">Баланс: 0</div>
+                        <div id="clicks" class="clicks">Кликов: 0</div>
+                        <div id="per-click">За клик: 1</div>
+                        <div id="passive-income">В секунду: 0</div>
+                    </div>
+                    <div class="energy-container">
+                        <div class="energy-label">Энергия:</div>
+                        <div class="energy-bar">
+                            <div class="energy-fill" id="energy-fill"></div>
+                        </div>
+                        <div class="energy-text" id="energy-text">1000/1000</div>
+                        <div class="energy-timer" id="energy-timer"></div>
+                    </div>
+                    <button id="clickButton" class="click-button">Клик</button>
+                </div>
+                
+                <!-- Магазин -->
+                <div id="shop-tab" class="tab-content" style="display: none;">
+                    <h2>Магазин улучшений</h2>
+                    <div id="shop-items">
+                        <!-- Сюда рендерится магазин через JavaScript -->
+                    </div>
+                </div>
+                
+                <!-- Рефералы -->
+                <div id="referrals-tab" class="tab-content" style="display: none;">
+                    <h2>Реферальная система</h2>
+                    
+                    <!-- Статистика -->
+                    <div class="referrals-stats">
+                        <div class="stat-card">
+                            <div class="stat-label">Приглашено пользователей</div>
+                            <div class="stat-value" id="referrals-count">0</div>
+                        </div>
+                        <div class="stat-card">
+                            <div class="stat-label">Заработано с рефералов</div>
+                            <div class="stat-value" id="referrals-earned">0 монет</div>
+                        </div>
+                    </div>
+                    
+                    <!-- Реферальная ссылка -->
+                    <div class="referral-link-section">
+                        <h3>Ваша реферальная ссылка</h3>
+                        <p class="referral-description">Поделитесь этой ссылкой с друзьями и получайте 10 монет за каждого приглашенного!</p>
+                        <div class="link-input-group">
+                            <input type="text" id="referral-link" class="referral-link-input" readonly>
+                            <button id="copy-link-btn" class="copy-link-btn">Копировать</button>
+                        </div>
+                    </div>
+                    
+                    <!-- Список рефералов -->
+                    <div class="referrals-list-section">
+                        <h3>Ваши рефералы</h3>
+                        <div id="referrals-list-content">
+                            <p class="empty-list">Загрузка...</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Лидерборд -->
+                <div id="leaderboard-tab" class="tab-content" style="display: none;">
+                    <h2>🏆 Лидерборд</h2>
+                    
+                    <div class="leaderboard-tabs">
+                        <button class="lb-tab active" data-type="global">🌍 Общий</button>
+                        <button class="lb-tab" data-type="friends">👥 Друзья</button>
+                        <button class="lb-tab" data-type="weekly">📅 Неделя</button>
+                    </div>
+                    
+                    <div class="leaderboard-container">
+                        <!-- Глобальный рейтинг -->
+                        <div id="global-leaderboard" class="leaderboard-list">
+                            <h3>🌍 Топ игроков</h3>
+                            <div class="loading">Загрузка рейтинга...</div>
+                        </div>
+                        
+                        <!-- Рейтинг друзей -->
+                        <div id="friends-leaderboard" class="leaderboard-list" style="display: none;">
+                            <h3>👥 Рейтинг друзей</h3>
+                            <div class="empty">У вас пока нет друзей в игре</div>
+                        </div>
+                        
+                        <!-- Недельный рейтинг -->
+                        <div id="weekly-leaderboard" class="leaderboard-list" style="display: none;">
+                            <h3>📅 Топ недели</h3>
+                            <div class="loading">Загрузка рейтинга...</div>
+                        </div>
+                    </div>
+                    
+                    <div class="user-position">
+                        <h3>Ваша позиция</h3>
+                        <div id="user-rank">Загрузка...</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div id="error" class="error" style="display: none;"></div>
+    </div>
+    <script src="app.js?v=1.0.1"></script>
+</body>
+</html>

@@ -1,0 +1,33 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "users",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "leaderboardVisible",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "totalEarned",
+          "order": "DESCENDING"
+        }
+      ]
+    },
+    {
+      "collectionGroup": "users",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {
+          "fieldPath": "leaderboardVisible",
+          "order": "ASCENDING"
+        },
+        {
+          "fieldPath": "weeklyEarned",
+          "order": "DESCENDING"
+        }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}
