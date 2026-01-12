@@ -546,161 +546,9 @@ async function checkAndCreateIndexes() {
     
     window.indexesStatus.checked = true;
     
-    // Показываем инструкции если индексы отсутствуют
-    if (window.indexesStatus.globalIndexExists === false || window.indexesStatus.weeklyIndexExists === false) {
-      showIndexCreationInstructions();
-    }
-    
   } catch (error) {
     console.error('Ошибка проверки индексов:', error);
   }
-}
-
-// Показ инструкций по созданию индексов
-function showIndexCreationInstructions() {
-  // Проверяем, не показывали ли уже инструкции
-  if (document.getElementById('index-instructions-modal')) {
-    return; // Уже показано
-  }
-  
-  const modal = document.createElement('div');
-  modal.id = 'index-instructions-modal';
-  modal.style.cssText = `
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.7);
-    z-index: 10000;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 20px;
-  `;
-  
-  const content = document.createElement('div');
-  content.style.cssText = `
-    background: white;
-    border-radius: 12px;
-    padding: 24px;
-    max-width: 600px;
-    max-height: 90vh;
-    overflow-y: auto;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.3);
-  `;
-  
-  const missingIndexes = [];
-  if (window.indexesStatus.globalIndexExists === false) {
-    missingIndexes.push('глобального лидерборда (totalEarned)');
-  }
-  if (window.indexesStatus.weeklyIndexExists === false) {
-    missingIndexes.push('недельного лидерборда (weeklyEarned)');
-  }
-  
-  content.innerHTML = `
-    <h2 style="margin-top: 0; color: #f44336;">⚠️ Требуется создание индексов Firestore</h2>
-    <p>Для корректной работы лидербордов необходимо создать индексы в Firebase Console.</p>
-    
-    <h3>Способ 1: Через Firebase Console (рекомендуется)</h3>
-    <ol style="line-height: 1.8;">
-      <li>Перейдите в <a href="https://console.firebase.google.com/project/telegram-clicker2/firestore/indexes" target="_blank">Firebase Console → Firestore Database → Indexes</a></li>
-      <li>Нажмите "Create index"</li>
-      ${window.indexesStatus.globalIndexExists === false ? `
-      <li><strong>Индекс #1 (глобальный лидерборд):</strong>
-        <ul>
-          <li>Collection ID: <code>users</code></li>
-          <li>Fields to index:
-            <ul>
-              <li>Field: <code>leaderboardVisible</code>, Type: <strong>Ascending</strong></li>
-              <li>Field: <code>totalEarned</code>, Type: <strong>Descending</strong></li>
-            </ul>
-          </li>
-          <li>Query scope: <strong>Collection</strong></li>
-        </ul>
-      </li>
-      ` : ''}
-      ${window.indexesStatus.weeklyIndexExists === false ? `
-      <li><strong>Индекс #2 (недельный лидерборд):</strong>
-        <ul>
-          <li>Collection ID: <code>users</code></li>
-          <li>Fields to index:
-            <ul>
-              <li>Field: <code>leaderboardVisible</code>, Type: <strong>Ascending</strong></li>
-              <li>Field: <code>weeklyEarned</code>, Type: <strong>Descending</strong></li>
-            </ul>
-          </li>
-          <li>Query scope: <strong>Collection</strong></li>
-        </ul>
-      </li>
-      ` : ''}
-      <li>Подождите несколько минут пока индексы создадутся</li>
-      <li>Обновите страницу после создания индексов</li>
-    </ol>
-    
-    <h3>Способ 2: Через Firebase CLI</h3>
-    <p>Если у вас установлен Firebase CLI, выполните:</p>
-    <pre style="background: #f5f5f5; padding: 12px; border-radius: 4px; overflow-x: auto;"><code>firebase deploy --only firestore:indexes</code></pre>
-    <p><small>Файл <code>firestore.indexes.json</code> уже создан в проекте.</small></p>
-    
-    <div style="margin-top: 20px; padding-top: 20px; border-top: 1px solid #ddd;">
-      <button id="close-index-instructions" style="
-        background: #4CAF50;
-        color: white;
-        border: none;
-        padding: 12px 24px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 16px;
-        width: 100%;
-      ">Понятно, закрыть</button>
-      <button id="retry-index-check" style="
-        background: #2196F3;
-        color: white;
-        border: none;
-        padding: 12px 24px;
-        border-radius: 6px;
-        cursor: pointer;
-        font-size: 16px;
-        width: 100%;
-        margin-top: 10px;
-      ">Проверить индексы снова</button>
-    </div>
-  `;
-  
-  modal.appendChild(content);
-  document.body.appendChild(modal);
-  
-  // Обработчики кнопок
-  document.getElementById('close-index-instructions').addEventListener('click', () => {
-    modal.remove();
-  });
-  
-  document.getElementById('retry-index-check').addEventListener('click', async () => {
-    window.indexesStatus.checked = false;
-    await checkAndCreateIndexes();
-    if (window.indexesStatus.globalIndexExists === true && window.indexesStatus.weeklyIndexExists === true) {
-      modal.remove();
-      // Перезагружаем лидерборд если он открыт
-      const leaderboardTab = document.getElementById('leaderboard-tab');
-      if (leaderboardTab && leaderboardTab.style.display !== 'none') {
-        const activeTab = document.querySelector('.lb-tab.active');
-        if (activeTab) {
-          const type = activeTab.getAttribute('data-type');
-          if (type) {
-            loadAndRenderLeaderboard(type);
-          }
-        }
-      }
-    }
-  });
-  
-  // Закрытие по клику вне модального окна
-  modal.addEventListener('click', (e) => {
-    if (e.target === modal) {
-      modal.remove();
-    }
-  });
 }
 
 // Обновление earned полей при кликах/покупках
@@ -1178,28 +1026,53 @@ async function loadUserData() {
         initFirebase();
     }
     
-    // ВСЕГДА используем тестовый режим для локальной разработки
-    window.isDevMode = true;
-    showDevModeIndicator();
-    console.log("Запуск в режиме разработки");
-    
-    const testUser = {
-        userId: "123456789",
-        firstName: "TestUser",
-        username: "testuser",
-        photoUrl: ""
-    };
-    
-    // Пропускаем весь код с Telegram
-    // И сразу работаем с Firebase
     if (!window.db) {
         console.error("Firestore not initialized!");
         return;
     }
     
-    try {
+    // Определяем режим работы: проверяем, запущено ли в Telegram
+    let userInfo = null;
+    
+    if (isTelegramWebApp()) {
+        // Режим Telegram - используем реальные данные
+        window.isDevMode = false;
+        hideDevModeIndicator();
         
-        const userRef = window.db.collection("users").doc(testUser.userId);
+        const tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand();
+        
+        const tgUser = tg.initDataUnsafe.user;
+        if (tgUser) {
+            userInfo = {
+                userId: tgUser.id.toString(),
+                firstName: tgUser.first_name || 'Пользователь',
+                username: tgUser.username || '',
+                photoUrl: tgUser.photo_url || ''
+            };
+            console.log("✅ Запуск в Telegram, пользователь:", userInfo);
+        } else {
+            console.error("Данные пользователя Telegram не найдены");
+            showError('Ошибка: данные пользователя Telegram не найдены');
+            return;
+        }
+    } else {
+        // Режим разработки - используем тестовые данные
+        window.isDevMode = true;
+        showDevModeIndicator();
+        console.log("⚠️ Запуск в режиме разработки (Telegram не обнаружен)");
+        
+        userInfo = {
+            userId: "123456789",
+            firstName: "TestUser",
+            username: "testuser",
+            photoUrl: ""
+        };
+    }
+    
+    try {
+        const userRef = window.db.collection("users").doc(userInfo.userId);
         const userDoc = await userRef.get();
         
         if (userDoc.exists) {
@@ -1264,7 +1137,6 @@ async function loadUserData() {
             window.userData.energy = Math.floor(window.userData.energy || 0);
             
             // Обновляем в Firestore если значения изменились
-            const userRef = window.db.collection("users").doc(testUser.userId);
             await userRef.update({
                 perClickValue: window.userData.perClickValue,
                 passiveIncome: window.userData.passiveIncome,
@@ -1300,8 +1172,9 @@ async function loadUserData() {
             console.log("Данные загружены:", window.userData);
             console.log("User data set:", window.userData);
         } else {
+            // Новый пользователь - создаем запись
             window.userData = { 
-                ...testUser, 
+                ...userInfo, 
                 balance: 0, 
                 totalClicks: 0, 
                 perClickValue: 1, 
@@ -1322,9 +1195,9 @@ async function loadUserData() {
             recalculateStats();
             
             await userRef.set({
-                userId: testUser.userId,
-                firstName: testUser.firstName,
-                username: testUser.username,
+                userId: userInfo.userId,
+                firstName: userInfo.firstName,
+                username: userInfo.username,
                 balance: 0,
                 totalClicks: 0,
                 perClickValue: window.userData.perClickValue,
