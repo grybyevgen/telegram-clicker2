@@ -89,6 +89,14 @@ h1 {
     cursor: pointer;
     transition: transform 0.1s, opacity 0.2s;
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    /* Предотвращение увеличения при клике */
+    user-select: none;
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none;
 }
 
 .click-button:active {

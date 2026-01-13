@@ -1022,7 +1022,13 @@ const firebaseConfig = {
 // Функция инициализации Firebase
 function initFirebase() {
   try {
-    if (!firebase.apps.length) {
+    // Проверяем, что Firebase SDK загружен
+    if (typeof firebase === 'undefined') {
+      console.error("❌ Firebase SDK не загружен");
+      throw new Error("Firebase SDK не загружен");
+    }
+    
+    if (!firebase.apps || !firebase.apps.length) {
       const app = firebase.initializeApp(firebaseConfig);
       window.db = firebase.firestore(); // NOT getFirestore(app)
       console.log("✅ Firebase initialized successfully");
@@ -1030,8 +1036,16 @@ function initFirebase() {
       window.db = firebase.firestore(); // NOT getFirestore(app)
       console.log("✅ Firebase already initialized");
     }
+    
+    // Проверяем, что db был установлен
+    if (!window.db) {
+      console.error("❌ Firestore не был создан");
+      throw new Error("Firestore не был создан");
+    }
   } catch (error) {
     console.error("❌ Firebase initialization error:", error);
+    window.db = null;
+    throw error; // Пробрасываем ошибку дальше
   }
 }
 
@@ -1251,9 +1265,6 @@ async function loadUserData() {
                 window.userData.lastWeeklyReset = firebase.firestore.FieldValue.serverTimestamp();
             }
             
-            // Восстанавливаем энергию на основе времени
-            updateEnergy();
-            
             // Сбрасываем недельный рейтинг если нужно
             await resetWeeklyIfNeeded();
             
@@ -1268,7 +1279,11 @@ async function loadUserData() {
             // Округляем энергию до целых
             window.userData.energy = Math.floor(window.userData.energy || 0);
             
-            // Обновляем в Firestore если значения изменились
+            // Восстанавливаем энергию на основе времени (БЕЗ перезаписи в БД здесь)
+            // Функция updateEnergy() сама обновит энергию в БД если нужно
+            updateEnergy();
+            
+            // Обновляем в Firestore (НО НЕ обновляем энергию - она уже обновлена в updateEnergy() или должна остаться из БД)
             const updateData = {
                 userId: window.userData.userId,
                 firstName: window.userData.firstName,
@@ -1279,10 +1294,8 @@ async function loadUserData() {
                 referrals: window.userData.referrals,
                 referralsEarned: window.userData.referralsEarned,
                 invitedBy: window.userData.invitedBy,
-                energy: window.userData.energy,
                 maxEnergy: window.userData.maxEnergy,
                 energyPerHour: window.userData.energyPerHour,
-                lastEnergyUpdate: window.userData.lastEnergyUpdate || firebase.firestore.FieldValue.serverTimestamp(),
                 totalEarned: window.userData.totalEarned,
                 weeklyEarned: window.userData.weeklyEarned,
                 leaderboardVisible: window.userData.leaderboardVisible,
@@ -1290,6 +1303,7 @@ async function loadUserData() {
                 lastActive: firebase.firestore.FieldValue.serverTimestamp()
             };
             
+            // НЕ обновляем energy и lastEnergyUpdate здесь - они уже обновлены в updateEnergy() или должны остаться из БД
             await userRef.update(updateData);
             
             updateUI();
@@ -1620,23 +1634,18 @@ function hideDevModeIndicator() {
 async function initApp() {
     try {
         // 1. Инициализация Firebase (compat версия)
-        // Конфигурация Firebase (замени значения)
-        const firebaseConfig = {
-            apiKey: "AIzaSyCSiUtRU12VLbNAgc34vVJlzq7sV6mOGvo",
-            authDomain: "telegram-clicker2.firebaseapp.com",
-            projectId: "telegram-clicker2",
-            storageBucket: "telegram-clicker2.firebasestorage.app",
-            messagingSenderId: "367826082536",
-            appId: "1:367826082536:web:be692072223caa20ed075d"
-        };
-        
+        // Используем функцию initFirebase(), которая проверяет, был ли Firebase уже инициализирован
         try {
-            const app = firebase.initializeApp(firebaseConfig);
-            window.db = firebase.firestore();
+            initFirebase();
+            if (!window.db) {
+                console.error("❌ Firestore не был инициализирован");
+                showError('Ошибка инициализации Firebase. Проверьте конфигурацию.');
+                return;
+            }
             console.log("✅ Firebase initialized successfully, db:", window.db);
         } catch (error) {
             console.error("❌ Firebase error:", error);
-            showError('Ошибка инициализации Firebase');
+            showError('Ошибка инициализации Firebase. Проверьте конфигурацию.');
             return;
         }
         
@@ -1721,6 +1730,12 @@ async function initApp() {
 // Обработчик для кнопки "Клик"
 if (clickButton) {
     clickButton.addEventListener('click', handleClick);
+    
+    // Предотвращение выделения текста при долгом нажатии
+    clickButton.addEventListener('contextmenu', function(e) {
+        e.preventDefault();
+        return false;
+    });
 }
 
 // Инициализация приложения (после загрузки DOM)
