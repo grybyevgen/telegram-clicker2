@@ -7,9 +7,8 @@
   function checkDependencies() {
     const statusEl = document.getElementById('load-status');
     
-    // Проверяем, что Firebase модули доступны (они загружаются динамически)
-    // В модульном подходе v9+ мы используем динамические импорты, поэтому проверка будет в initFirebase
-    // Здесь просто проверяем, что скрипты загружены
+    // Проверяем, что Firebase модули доступны (они загружаются через script теги в HTML)
+    // Модули загружаются в index.html, здесь просто проверяем, что скрипты загружены
     
     if (typeof Telegram === 'undefined') {
       console.log("Telegram SDK не найден (нормально в браузере)");
@@ -1280,51 +1279,50 @@ window.firebaseInitPromise = null;
 window.firebaseInitialized = false;
 window.firebaseInitFailed = false;
 
-// Функция динамической загрузки Firebase модулей с fallback
-async function loadFirebaseModules() {
-  const firebaseVersion = '10.7.0';
-  const baseUrl = 'https://www.gstatic.com/firebasejs';
-  
-  // Список URL для попыток загрузки (можно добавить альтернативные CDN)
-  const urls = {
-    app: `${baseUrl}/${firebaseVersion}/firebase-app.js`,
-    firestore: `${baseUrl}/${firebaseVersion}/firebase-firestore.js`
-  };
-  
-  try {
-    console.log("📦 Попытка загрузки Firebase модулей...");
-    
-    // Пробуем загрузить модули с обработкой CORS ошибок
-    const [appModule, firestoreModule] = await Promise.all([
-      import(urls.app).catch(err => {
-        console.warn("⚠️ Ошибка загрузки firebase-app.js:", err);
-        throw new Error(`Не удалось загрузить Firebase App модуль: ${err.message}`);
-      }),
-      import(urls.firestore).catch(err => {
-        console.warn("⚠️ Ошибка загрузки firebase-firestore.js:", err);
-        throw new Error(`Не удалось загрузить Firestore модуль: ${err.message}`);
-      })
-    ]);
-    
-    console.log("✅ Firebase модули успешно загружены");
-    return { appModule, firestoreModule };
-    
-  } catch (error) {
-    console.error("❌ Критическая ошибка загрузки Firebase модулей:", error);
-    
-    // Проверяем, является ли это CORS ошибкой или проблемой сети
-    if (error.message && (
-      error.message.includes('Failed to fetch') ||
-      error.message.includes('CORS') ||
-      error.message.includes('NetworkError') ||
-      error.name === 'TypeError'
-    )) {
-      console.error("❌ Обнаружена проблема с CORS или сетью. Firebase недоступен.");
-      throw new Error('Не удалось загрузить Firebase модули. Проверьте подключение к интернету.');
+// Функция ожидания загрузки Firebase модулей (загружаются через script теги в HTML)
+async function waitForFirebaseModules(timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    // Если модули уже загружены
+    if (window.firebaseModulesReady && window.firebaseAppModule && window.firebaseFirestoreModule) {
+      console.log("✅ Firebase модули уже загружены");
+      resolve({
+        appModule: window.firebaseAppModule,
+        firestoreModule: window.firebaseFirestoreModule
+      });
+      return;
     }
     
-    throw error;
-  }
+    // Ждем события загрузки модулей
+    const timeoutId = setTimeout(() => {
+      reject(new Error('Таймаут ожидания загрузки Firebase модулей. Проверьте подключение к интернету.'));
+    }, timeout);
+    
+    window.addEventListener('firebaseModulesLoaded', () => {
+      clearTimeout(timeoutId);
+      if (window.firebaseAppModule && window.firebaseFirestoreModule) {
+        console.log("✅ Firebase модули загружены через событие");
+        resolve({
+          appModule: window.firebaseAppModule,
+          firestoreModule: window.firebaseFirestoreModule
+        });
+      } else {
+        reject(new Error('Firebase модули не были правильно загружены'));
+      }
+    }, { once: true });
+    
+    // Проверяем периодически (на случай если событие уже произошло)
+    const checkInterval = setInterval(() => {
+      if (window.firebaseModulesReady && window.firebaseAppModule && window.firebaseFirestoreModule) {
+        clearInterval(checkInterval);
+        clearTimeout(timeoutId);
+        console.log("✅ Firebase модули обнаружены при проверке");
+        resolve({
+          appModule: window.firebaseAppModule,
+          firestoreModule: window.firebaseFirestoreModule
+        });
+      }
+    }, 100);
+  });
 }
 
 // Функция автоматического восстановления Firebase с повторными попытками
@@ -1376,15 +1374,17 @@ async function initFirebase() {
     try {
       console.log("🔧 Начало инициализации Firebase (модульный подход v9+)...");
       
-      // Загружаем модули Firebase
+      // Ждем загрузки модулей Firebase (загружаются через script теги в HTML)
       let appModule, firestoreModule;
       try {
-        const modules = await loadFirebaseModules();
+        console.log("⏳ Ожидание загрузки Firebase модулей...");
+        const modules = await waitForFirebaseModules(15000);
         appModule = modules.appModule;
         firestoreModule = modules.firestoreModule;
+        console.log("✅ Firebase модули получены");
       } catch (loadError) {
-        // Firebase обязателен, не переходим в offline режим
-        throw loadError;
+        console.error("❌ Ошибка ожидания Firebase модулей:", loadError);
+        throw new Error(`Не удалось загрузить Firebase модули: ${loadError.message}`);
       }
       
       // Импортируем необходимые функции
