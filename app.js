@@ -1039,14 +1039,29 @@ function initFirebase() {
     // Проверяем, что Firebase SDK загружен
     if (typeof firebase === 'undefined') {
       console.error("❌ Firebase SDK не загружен");
-      throw new Error("Firebase SDK не загружен");
+      console.error("Проверьте, что скрипты Firebase подключены в index.html");
+      throw new Error("Firebase SDK не загружен. Проверьте подключение скриптов в index.html");
     }
     
+    // Проверяем наличие необходимых модулей
+    if (!firebase.firestore) {
+      console.error("❌ Firestore модуль не загружен");
+      throw new Error("Firestore модуль не загружен. Проверьте подключение firebase-firestore-compat.js");
+    }
+    
+    console.log("Конфигурация Firebase:", {
+      projectId: firebaseConfig.projectId,
+      apiKey: firebaseConfig.apiKey ? firebaseConfig.apiKey.substring(0, 10) + '...' : 'не указан',
+      authDomain: firebaseConfig.authDomain
+    });
+    
     if (!firebase.apps || !firebase.apps.length) {
+      console.log("Инициализация нового Firebase приложения...");
       const app = firebase.initializeApp(firebaseConfig);
       window.db = firebase.firestore(); // NOT getFirestore(app)
-      console.log("✅ Firebase initialized successfully");
+      console.log("✅ Firebase initialized successfully, app:", app.name);
     } else {
+      console.log("Firebase уже инициализирован, используем существующий экземпляр");
       window.db = firebase.firestore(); // NOT getFirestore(app)
       console.log("✅ Firebase already initialized");
     }
@@ -1054,10 +1069,18 @@ function initFirebase() {
     // Проверяем, что db был установлен
     if (!window.db) {
       console.error("❌ Firestore не был создан");
-      throw new Error("Firestore не был создан");
+      throw new Error("Firestore не был создан. Проверьте конфигурацию Firebase.");
     }
+    
+    // Пробуем выполнить простой запрос для проверки подключения
+    console.log("✅ Firestore создан успешно, db:", window.db);
   } catch (error) {
     console.error("❌ Firebase initialization error:", error);
+    console.error("Детали ошибки инициализации:", {
+      message: error.message,
+      code: error.code,
+      stack: error.stack
+    });
     window.db = null;
     throw error; // Пробрасываем ошибку дальше
   }
@@ -1235,11 +1258,20 @@ async function loadUserData() {
     
     // Инициализируем Firebase если еще не инициализирован
     if (!window.db) {
-        initFirebase();
+        try {
+            initFirebase();
+        } catch (error) {
+            console.error("Ошибка инициализации Firebase в loadUserData:", error);
+            showError(`Ошибка инициализации Firebase: ${error.message || error}`);
+            hideLoading();
+            return;
+        }
     }
     
     if (!window.db) {
         console.error("Firestore not initialized!");
+        showError('Ошибка: Firestore не был инициализирован. Проверьте конфигурацию Firebase.');
+        hideLoading();
         return;
     }
     
@@ -1357,8 +1389,17 @@ async function loadUserData() {
     }
     
     try {
+        // Проверяем подключение к Firestore перед выполнением запросов
+        if (!window.db || typeof window.db.collection !== 'function') {
+            throw new Error("Firestore не инициализирован или недоступен");
+        }
+        
+        console.log("Подключение к Firestore, userId:", userInfo.userId);
         const userRef = window.db.collection("users").doc(userInfo.userId);
+        
+        console.log("Выполнение запроса к Firestore...");
         const userDoc = await userRef.get();
+        console.log("Запрос выполнен, документ существует:", userDoc.exists);
         
         if (userDoc.exists) {
             window.userData = userDoc.data();
@@ -1555,7 +1596,33 @@ async function loadUserData() {
         }
     } catch (error) {
         console.error("Ошибка Firebase:", error);
-        showError('Ошибка соединения с базой данных. Проверьте конфигурацию Firebase.');
+        console.error("Детали ошибки:", {
+            message: error.message,
+            code: error.code,
+            stack: error.stack
+        });
+        
+        // Более детальное сообщение об ошибке
+        let errorMessage = 'Ошибка соединения с базой данных. ';
+        if (error.code) {
+            switch (error.code) {
+                case 'permission-denied':
+                    errorMessage += 'Недостаточно прав доступа. Проверьте правила Firestore.';
+                    break;
+                case 'unavailable':
+                    errorMessage += 'Сервис недоступен. Проверьте подключение к интернету.';
+                    break;
+                case 'unauthenticated':
+                    errorMessage += 'Требуется аутентификация.';
+                    break;
+                default:
+                    errorMessage += `Код ошибки: ${error.code}. ${error.message || ''}`;
+            }
+        } else {
+            errorMessage += error.message || 'Проверьте конфигурацию Firebase.';
+        }
+        
+        showError(errorMessage);
         hideLoading();
     }
 }
