@@ -21,14 +21,24 @@ body {
     top: 0;
     left: 0;
     right: 0;
-    background: #ff4444;
+    background: linear-gradient(135deg, #ff6b6b, #ff4444);
     color: white;
     text-align: center;
-    padding: 8px;
-    font-size: 14px;
+    padding: 10px;
+    font-size: 13px;
     font-weight: 600;
     z-index: 1000;
-    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+    0%, 100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.8;
+    }
 }
 
 #app {

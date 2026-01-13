@@ -35,7 +35,8 @@
 })();
 
 // Глобальные переменные
-window.isDevMode = true;
+// Режим разработки определяется автоматически при запуске
+window.isDevMode = false; // Будет установлен в true если Telegram не обнаружен
 window.userData = null;
 window.db = null;
 window.passiveIncomeInterval = null;
@@ -1435,17 +1436,19 @@ async function initFirebase() {
       
       // Явно включаем сеть для Firestore (важно для избежания ошибки "client is offline")
       try {
-        const { enableNetwork, waitForPendingWrites } = firestoreModule;
+        const { enableNetwork } = firestoreModule;
         console.log("🌐 Включение сети Firestore...");
         await enableNetwork(window.db);
         console.log("✅ Сеть Firestore включена");
         
-        // Ждем завершения всех ожидающих записей
-        try {
-          await waitForPendingWrites(window.db);
-          console.log("✅ Все ожидающие записи завершены");
-        } catch (waitError) {
-          console.warn("⚠️ Предупреждение при ожидании записей:", waitError);
+        // waitForPendingWrites может быть недоступна в некоторых версиях, пропускаем
+        if (firestoreModule.waitForPendingWrites && typeof firestoreModule.waitForPendingWrites === 'function') {
+          try {
+            await firestoreModule.waitForPendingWrites(window.db);
+            console.log("✅ Все ожидающие записи завершены");
+          } catch (waitError) {
+            console.warn("⚠️ Предупреждение при ожидании записей:", waitError);
+          }
         }
       } catch (networkError) {
         console.warn("⚠️ Не удалось включить сеть Firestore:", networkError);
@@ -1683,31 +1686,53 @@ function parseAllInitData(initDataString) {
 function parseInitData(initDataString) {
     try {
         if (!initDataString || typeof initDataString !== 'string') {
+            console.warn("⚠️ parseInitData: initDataString пустая или не строка");
             return null;
         }
+        
+        console.log("🔍 Парсинг initData строки, длина:", initDataString.length);
         
         // Используем новую функцию парсинга
-        const parsedData = parseAllInitData(initDataString);
-        if (parsedData && parsedData.user) {
-            return parsedData.user;
-        }
-        
-        // Fallback для старого формата
-        const params = new URLSearchParams(initDataString);
-        const userParam = params.get('user');
-        
-        if (!userParam) return null;
-        
-        // Декодируем и парсим JSON
         try {
-            const decoded = decodeURIComponent(userParam);
-            return JSON.parse(decoded);
-        } catch (e) {
-            console.error('Ошибка парсинга user данных:', e);
-            return null;
+            const parsedData = parseAllInitData(initDataString);
+            if (parsedData && parsedData.user) {
+                console.log("✅ Пользователь найден через parseAllInitData");
+                return parsedData.user;
+            } else {
+                console.log("ℹ️ parseAllInitData не вернул user, пробуем fallback");
+            }
+        } catch (parseError) {
+            console.warn("⚠️ Ошибка в parseAllInitData:", parseError);
         }
+        
+        // Fallback для старого формата - парсим как URL параметры
+        try {
+            const params = new URLSearchParams(initDataString);
+            const userParam = params.get('user');
+            
+            if (userParam) {
+                console.log("✅ Найден параметр user в initData");
+                // Декодируем и парсим JSON
+                try {
+                    const decoded = decodeURIComponent(userParam);
+                    const userData = JSON.parse(decoded);
+                    console.log("✅ Пользователь успешно распарсен из initData");
+                    return userData;
+                } catch (e) {
+                    console.error('❌ Ошибка парсинга user данных:', e);
+                    console.log("📝 userParam:", userParam.substring(0, 100));
+                }
+            } else {
+                console.warn("⚠️ Параметр 'user' не найден в initData");
+                console.log("📝 Доступные параметры:", Array.from(params.keys()));
+            }
+        } catch (urlError) {
+            console.warn("⚠️ Ошибка парсинга initData как URL:", urlError);
+        }
+        
+        return null;
     } catch (error) {
-        console.error('Общая ошибка парсинга initData:', error);
+        console.error('❌ Общая ошибка парсинга initData:', error);
         return null;
     }
 }
@@ -1802,47 +1827,72 @@ async function loadUserData() {
         // Если initDataUnsafe недоступен (например, в десктопной версии), парсим initData строку
         let tgUser = null;
         
+        // Детальная отладка доступных данных
+        console.log("🔍 Отладка данных Telegram WebApp:", {
+            hasInitDataUnsafe: !!tg.initDataUnsafe,
+            hasInitData: !!tg.initData,
+            initDataUnsafeKeys: tg.initDataUnsafe ? Object.keys(tg.initDataUnsafe) : [],
+            initDataUnsafeUser: tg.initDataUnsafe?.user ? 'present' : 'missing',
+            initDataLength: tg.initData ? tg.initData.length : 0
+        });
+        
         // Способ 1: Используем initDataUnsafe (работает в мобильной версии)
-        if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
-            tgUser = tg.initDataUnsafe.user;
-            console.log("✅ Данные пользователя получены из initDataUnsafe");
+        if (tg.initDataUnsafe) {
+            console.log("📦 initDataUnsafe содержимое:", JSON.stringify(tg.initDataUnsafe, null, 2));
+            
+            if (tg.initDataUnsafe.user) {
+                tgUser = tg.initDataUnsafe.user;
+                console.log("✅ Данные пользователя получены из initDataUnsafe.user");
+            } else {
+                console.warn("⚠️ initDataUnsafe.user отсутствует, проверяем другие способы...");
+            }
         }
         
         // Способ 2: Парсим initData строку (для десктопной версии и fallback)
         if (!tgUser && tg.initData) {
-            console.log("Попытка парсинга initData строки...");
+            console.log("🔍 Попытка парсинга initData строки...");
+            console.log("📝 initData (первые 200 символов):", tg.initData.substring(0, 200));
             tgUser = parseInitData(tg.initData);
             if (tgUser) {
                 console.log("✅ Данные пользователя получены из initData строки");
+            } else {
+                console.warn("⚠️ Не удалось распарсить initData строку");
             }
         }
         
         // Если данные пользователя еще не загружены, ждем немного и пробуем снова
         if (!tgUser) {
-            console.warn("Данные пользователя Telegram еще не загружены, ждем...");
+            console.warn("⏳ Данные пользователя Telegram еще не загружены, ждем...");
             
-            // Ждем до 2 секунд для загрузки данных
+            // Ждем до 3 секунд для загрузки данных (увеличено время ожидания)
             let attempts = 0;
-            while (attempts < 20 && !tgUser) {
+            const maxAttempts = 30; // 3 секунды
+            
+            while (attempts < maxAttempts && !tgUser) {
                 await new Promise(resolve => setTimeout(resolve, 100));
                 
                 // Пробуем initDataUnsafe снова
                 if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
                     tgUser = tg.initDataUnsafe.user;
-                    console.log("✅ Данные пользователя получены из initDataUnsafe после ожидания");
+                    console.log(`✅ Данные пользователя получены из initDataUnsafe после ожидания (попытка ${attempts + 1})`);
                     break;
                 }
                 
-                // Пробуем парсить initData снова
+                // Пробуем парсить initData снова (на случай если initData появился позже)
                 if (!tgUser && tg.initData) {
                     tgUser = parseInitData(tg.initData);
                     if (tgUser) {
-                        console.log("✅ Данные пользователя получены из initData строки после ожидания");
+                        console.log(`✅ Данные пользователя получены из initData строки после ожидания (попытка ${attempts + 1})`);
                         break;
                     }
                 }
                 
                 attempts++;
+                
+                // Логируем каждые 5 попыток
+                if (attempts % 5 === 0) {
+                    console.log(`⏳ Ожидание данных пользователя... (попытка ${attempts}/${maxAttempts})`);
+                }
             }
         }
         
@@ -1869,10 +1919,20 @@ async function loadUserData() {
             });
         } else {
             console.error("❌ Не удалось получить данные пользователя Telegram");
-            console.log("Доступные данные initDataUnsafe:", tg.initDataUnsafe);
-            console.log("Доступна initData строка:", !!tg.initData, tg.initData ? tg.initData.substring(0, 100) + '...' : 'нет');
-            console.log("Платформа:", tg.platform || 'не указана');
-            showError('Ошибка: не удалось получить данные пользователя Telegram. Попробуйте перезапустить приложение.');
+            console.log("📊 Детальная диагностика:");
+            console.log("  - initDataUnsafe:", tg.initDataUnsafe ? JSON.stringify(tg.initDataUnsafe, null, 2) : 'отсутствует');
+            console.log("  - initData строка:", tg.initData ? `присутствует (${tg.initData.length} символов)` : 'отсутствует');
+            console.log("  - Платформа:", tg.platform || 'не указана');
+            console.log("  - Версия:", tg.version || 'не указана');
+            console.log("  - Все свойства tg:", Object.keys(tg));
+            
+            // Пытаемся использовать альтернативный способ - через start_param или другие данные
+            // В некоторых случаях пользователь может быть не авторизован, но приложение все равно должно работать
+            console.warn("⚠️ Пользователь не авторизован в Telegram WebApp. Это может быть нормально для некоторых сценариев.");
+            console.warn("💡 Попробуйте: 1) Перезапустить приложение 2) Проверить настройки бота 3) Убедиться что пользователь авторизован");
+            
+            showError('Ошибка: не удалось получить данные пользователя Telegram. Убедитесь, что вы авторизованы в Telegram и перезапустите приложение.');
+            hideLoading();
             return;
         }
     } else {
@@ -1880,13 +1940,38 @@ async function loadUserData() {
         window.isDevMode = true;
         showDevModeIndicator();
         console.log("⚠️ Запуск в режиме разработки (Telegram не обнаружен)");
+        console.log("💡 Для тестирования в браузере используйте Live Server");
+        console.log("💡 Приложение будет работать с тестовым пользователем");
         
-        userInfo = {
-            userId: "123456789",
-            firstName: "TestUser",
-            username: "testuser",
-            photoUrl: ""
-        };
+        // Можно использовать разные тестовые пользователи через URL параметр ?testUser=1,2,3
+        const urlParams = new URLSearchParams(window.location.search);
+        const testUserNum = parseInt(urlParams.get('testUser') || '1');
+        
+        const testUsers = [
+            {
+                userId: "123456789",
+                firstName: "TestUser",
+                username: "testuser",
+                photoUrl: ""
+            },
+            {
+                userId: "987654321",
+                firstName: "TestUser2",
+                username: "testuser2",
+                photoUrl: ""
+            },
+            {
+                userId: "555555555",
+                firstName: "TestUser3",
+                username: "testuser3",
+                photoUrl: ""
+            }
+        ];
+        
+        const selectedTestUser = testUsers[(testUserNum - 1) % testUsers.length];
+        userInfo = selectedTestUser;
+        
+        console.log(`👤 Используется тестовый пользователь #${testUserNum}:`, userInfo);
     }
     
     try {
@@ -2416,6 +2501,12 @@ function hideError() {
 function showDevModeIndicator() {
     if (devModeIndicator) {
         devModeIndicator.style.display = 'block';
+        // Добавляем информацию о тестовом пользователе
+        const urlParams = new URLSearchParams(window.location.search);
+        const testUserNum = parseInt(urlParams.get('testUser') || '1');
+        if (testUserNum > 1) {
+            devModeIndicator.textContent = `🧪 Режим разработки (Тестовый пользователь #${testUserNum})`;
+        }
     }
 }
 
@@ -2621,6 +2712,15 @@ async function initApp() {
         const isTelegram = isTelegramWebApp();
         console.log("🔍 Проверка Telegram Web App:", isTelegram ? "✅ Обнаружен" : "❌ Не обнаружен");
         
+        if (!isTelegram) {
+            // Режим разработки - показываем информацию
+            console.log('⚠️ Telegram WebApp не обнаружен - режим разработки');
+            console.log('💡 Приложение работает в режиме локального тестирования');
+            console.log('💡 Используйте ?testUser=1,2,3 в URL для переключения тестовых пользователей');
+            window.isDevMode = true;
+            showDevModeIndicator();
+        }
+        
         // 2. Ожидание загрузки Telegram SDK (для десктопной версии может потребоваться время)
         await waitForTelegram(5000);
         
@@ -2629,8 +2729,8 @@ async function initApp() {
         const tg = getTelegramWebApp();
         if (tg) {
             setupTelegramWebApp(tg);
-        } else {
-            console.log('⚠️ Telegram WebApp не обнаружен - режим разработки');
+            window.isDevMode = false;
+            hideDevModeIndicator();
         }
         
         // 4. Инициализация Firebase (модульный подход v9+) - обязательна

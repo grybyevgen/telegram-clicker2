@@ -34,6 +34,18 @@
         Timestamp
       };
       
+      // waitForPendingWrites может быть недоступна в некоторых версиях
+      // Проверяем и добавляем если доступна
+      try {
+        // Пытаемся получить из того же импорта
+        const firestoreModule = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
+        if (firestoreModule.waitForPendingWrites) {
+          window.firebaseFirestoreModule.waitForPendingWrites = firestoreModule.waitForPendingWrites;
+        }
+      } catch (e) {
+        // Игнорируем, функция может быть недоступна
+      }
+      
       // Устанавливаем флаг готовности
       window.firebaseModulesReady = true;
       console.log("✅ Firebase модули загружены через script теги");
@@ -49,7 +61,7 @@
         <div id="load-status">Проверка зависимостей</div>
     </div>
     <div id="devModeIndicator" class="dev-mode-indicator" style="display: none;">
-        Режим разработки
+        🧪 Режим разработки (Локальное тестирование)
     </div>
     <div id="app">
         <h1>Telegram Clicker</h1>
