@@ -43,7 +43,7 @@ window.passiveIncomeInterval = null;
 window.energyUpdateInterval = null;
 window.syncInProgress = false;
 window.lastSyncTime = null;
-window.connectionStatus = 'unknown'; // 'online', 'offline', 'syncing', 'unknown'
+window.connectionStatus = 'unknown'; // 'online', 'syncing', 'unknown'
 window.firebaseRetryCount = 0;
 window.maxRetryAttempts = 3;
 window.retryDelay = 5000; // 5 секунд
@@ -197,99 +197,6 @@ function renderShop() {
   });
 }
 
-// Функция сохранения данных в localStorage (для offline режима)
-function saveUserDataToLocalStorage() {
-  if (!window.userData || !window.userData.userId) return;
-  
-  try {
-    const savedDataKey = `userData_${window.userData.userId}`;
-    // Преобразуем Timestamp объекты в строки для сохранения
-    const dataToSave = JSON.parse(JSON.stringify(window.userData, (key, value) => {
-      // Обрабатываем Timestamp объекты
-      if (value && typeof value === 'object' && 'seconds' in value) {
-        return new Date(value.seconds * 1000).toISOString();
-      }
-      return value;
-    }));
-    // Добавляем метку времени последнего изменения
-    dataToSave._lastModified = new Date().toISOString();
-    localStorage.setItem(savedDataKey, JSON.stringify(dataToSave));
-    console.log("💾 Данные сохранены в localStorage");
-  } catch (error) {
-    console.warn("⚠️ Не удалось сохранить данные в localStorage:", error);
-  }
-}
-
-// Функция синхронизации данных из localStorage с Firebase
-async function syncDataFromLocalStorage() {
-  if (window.syncInProgress || window.offlineMode || !window.db || !window.firebaseFirestore) {
-    return;
-  }
-  
-  if (!window.userData || !window.userData.userId) {
-    return;
-  }
-  
-  try {
-    window.syncInProgress = true;
-    updateConnectionStatus('syncing');
-    
-    const savedDataKey = `userData_${window.userData.userId}`;
-    const savedDataStr = localStorage.getItem(savedDataKey);
-    
-    if (!savedDataStr) {
-      window.syncInProgress = false;
-      updateConnectionStatus('online');
-      return;
-    }
-    
-    const savedData = JSON.parse(savedDataStr);
-    const lastModified = savedData._lastModified ? new Date(savedData._lastModified) : null;
-    
-    // Загружаем данные из Firebase для сравнения
-    const userRef = getDocRef('users', window.userData.userId);
-    const firebaseDoc = await window.firebaseFirestore.getDoc(userRef);
-    
-    if (!firebaseDoc.exists()) {
-      // Если документа нет в Firebase, создаем его из localStorage
-      delete savedData._lastModified;
-      await window.firebaseFirestore.setDoc(userRef, {
-        ...savedData,
-        lastActive: window.firebaseFirestore.serverTimestamp()
-      });
-      console.log("✅ Данные синхронизированы: создан новый документ в Firebase");
-    } else {
-      const firebaseData = firebaseDoc.data();
-      const firebaseLastActive = firebaseData.lastActive;
-      
-      // Сравниваем время последнего изменения
-      // Если локальные данные новее, обновляем Firebase
-      if (lastModified && (!firebaseLastActive || lastModified > firebaseLastActive.toDate())) {
-        delete savedData._lastModified;
-        await window.firebaseFirestore.updateDoc(userRef, {
-          ...savedData,
-          lastActive: window.firebaseFirestore.serverTimestamp()
-        });
-        console.log("✅ Данные синхронизированы: локальные данные обновлены в Firebase");
-      } else {
-        // Если данные в Firebase новее, обновляем локальные данные
-        window.userData = { ...firebaseData, userId: window.userData.userId };
-        saveUserDataToLocalStorage();
-        updateUI();
-        console.log("✅ Данные синхронизированы: Firebase данные загружены локально");
-      }
-    }
-    
-    window.lastSyncTime = new Date();
-    updateConnectionStatus('online');
-    
-  } catch (error) {
-    console.error("❌ Ошибка синхронизации данных:", error);
-    updateConnectionStatus('offline');
-  } finally {
-    window.syncInProgress = false;
-  }
-}
 
 // Функция обновления статуса соединения и отображения уведомлений
 function updateConnectionStatus(status) {
@@ -328,11 +235,6 @@ function updateConnectionStatus(status) {
         }
       }, 2000);
       break;
-    case 'offline':
-      statusNotification.textContent = '📴 Офлайн режим - данные сохраняются локально';
-      statusNotification.style.background = '#ff9800';
-      statusNotification.style.color = '#ffffff';
-      break;
     case 'syncing':
       statusNotification.textContent = '🔄 Синхронизация данных...';
       statusNotification.style.background = '#2196F3';
@@ -343,58 +245,18 @@ function updateConnectionStatus(status) {
   }
 }
 
-// Мониторинг состояния сети
+// Мониторинг состояния сети (базовый)
 function setupNetworkMonitoring() {
-  // Слушаем события online/offline браузера
-  window.addEventListener('online', async () => {
+  // Слушаем события online браузера
+  window.addEventListener('online', () => {
     console.log("🌐 Соединение восстановлено");
-    updateConnectionStatus('syncing');
-    
-    // Пытаемся переинициализировать Firebase с повторными попытками
-    if (window.offlineMode) {
-      try {
-        await retryFirebaseInit(window.maxRetryAttempts, window.retryDelay);
-        if (window.firebaseInitialized) {
-          window.offlineMode = false;
-          // Синхронизируем данные
-          await syncDataFromLocalStorage();
-        }
-      } catch (error) {
-        console.error("Ошибка переинициализации Firebase:", error);
-        updateConnectionStatus('offline');
-      }
-    } else {
-      await syncDataFromLocalStorage();
-    }
+    updateConnectionStatus('online');
   });
   
   window.addEventListener('offline', () => {
     console.log("📴 Соединение потеряно");
-    updateConnectionStatus('offline');
-    window.offlineMode = true;
+    showError('Нет подключения к интернету. Приложение требует подключения к Firebase.');
   });
-  
-  // Периодическая проверка соединения
-  setInterval(async () => {
-    if (navigator.onLine && window.offlineMode && window.db && window.firebaseFirestore) {
-      try {
-        // Пробуем выполнить простой запрос для проверки соединения
-        const testRef = getDocRef('users', window.userData?.userId || 'test');
-        await window.firebaseFirestore.getDoc(testRef);
-        // Если запрос успешен, синхронизируем данные
-        if (window.offlineMode) {
-          window.offlineMode = false;
-          await syncDataFromLocalStorage();
-        }
-      } catch (error) {
-        // Соединение все еще недоступно
-        if (!window.offlineMode) {
-          window.offlineMode = true;
-          updateConnectionStatus('offline');
-        }
-      }
-    }
-  }, 30000); // Проверяем каждые 30 секунд
 }
 
 // ФУНКЦИЯ: Обновление энергии по времени
@@ -404,15 +266,12 @@ async function updateEnergy() {
   const now = new Date();
   let lastUpdate;
   
-  // Обрабатываем Timestamp из модульного API или строку из localStorage
+  // Обрабатываем Timestamp из модульного API
   if (window.userData.lastEnergyUpdate && typeof window.userData.lastEnergyUpdate.toDate === 'function') {
     lastUpdate = window.userData.lastEnergyUpdate.toDate();
   } else if (window.userData.lastEnergyUpdate && window.userData.lastEnergyUpdate.seconds) {
     // Если это Timestamp объект с seconds
     lastUpdate = new Date(window.userData.lastEnergyUpdate.seconds * 1000);
-  } else if (typeof window.userData.lastEnergyUpdate === 'string') {
-    // Если это строка из localStorage
-    lastUpdate = new Date(window.userData.lastEnergyUpdate);
   } else {
     lastUpdate = new Date(window.userData.lastEnergyUpdate);
   }
@@ -429,8 +288,8 @@ async function updateEnergy() {
     // Округляем энергию до целых
     window.userData.energy = Math.floor(window.userData.energy);
     
-    // Обновляем в Firestore только если энергия изменилась и не в offline режиме
-    if (window.userData.energy !== oldEnergy && !window.offlineMode && window.db && window.firebaseFirestore) {
+    // Обновляем в Firestore только если энергия изменилась
+    if (window.userData.energy !== oldEnergy && window.db && window.firebaseFirestore) {
       try {
         const userRef = getDocRef('users', window.userData.userId);
         await window.firebaseFirestore.updateDoc(userRef, {
@@ -444,16 +303,8 @@ async function updateEnergy() {
         console.log(`updateEnergy: Энергия обновлена: ${oldEnergy} -> ${window.userData.energy}`);
       } catch (err) {
         console.error('Ошибка обновления энергии:', err);
-        // Сохраняем в localStorage в случае ошибки
-        window.userData.lastEnergyUpdate = now.toISOString();
-        saveUserDataToLocalStorage();
+        throw err; // Пробрасываем ошибку, так как Firebase обязателен
       }
-    } else if (window.userData.energy !== oldEnergy) {
-      // В offline режиме или если нет подключения - сохраняем в localStorage
-      window.userData.lastEnergyUpdate = now.toISOString();
-      saveUserDataToLocalStorage();
-      updateEnergyUI();
-      console.log(`updateEnergy (offline): Энергия обновлена: ${oldEnergy} -> ${window.userData.energy}`);
     }
   }
 }
@@ -548,8 +399,8 @@ async function buyUpgrade(upgradeId) {
     });
   }
   
-  // Сохраняем в Firestore (если не в offline режиме)
-  if (!window.offlineMode && window.db && window.firebaseFirestore) {
+  // Сохраняем в Firestore
+  if (window.db && window.firebaseFirestore) {
     try {
       const userRef = getDocRef("users", window.userData.userId);
       await window.firebaseFirestore.updateDoc(userRef, {
@@ -564,13 +415,11 @@ async function buyUpgrade(upgradeId) {
       });
       console.log("✅ Данные сохранены в Firebase");
     } catch (error) {
-      console.warn('buyUpgrade: Ошибка сохранения в Firestore, сохраняем локально:', error);
-      // Сохраняем в localStorage в случае ошибки
-      saveUserDataToLocalStorage();
+      console.error('buyUpgrade: Ошибка сохранения в Firestore:', error);
+      throw error; // Пробрасываем ошибку, так как Firebase обязателен
     }
   } else {
-    // В offline режиме сохраняем только в localStorage
-    saveUserDataToLocalStorage();
+    throw new Error('Firestore не инициализирован');
   }
   
   console.log(`buyUpgrade: Куплено ${upgrade.name}, уровень: ${level + 1}, новые значения:`, {
@@ -932,8 +781,8 @@ async function updateEarnedStats(amount) {
   window.userData.totalEarned = (window.userData.totalEarned || 0) + amount;
   window.userData.weeklyEarned = (window.userData.weeklyEarned || 0) + amount;
   
-  // Сохраняем в Firestore (если не в offline режиме)
-  if (!window.offlineMode && window.db && window.firebaseFirestore) {
+  // Сохраняем в Firestore
+  if (window.db && window.firebaseFirestore) {
     try {
       const userRef = getDocRef('users', window.userData.userId);
       await window.firebaseFirestore.updateDoc(userRef, {
@@ -942,12 +791,10 @@ async function updateEarnedStats(amount) {
       });
     } catch (error) {
       console.error('Ошибка обновления статистики заработанного:', error);
-      // Сохраняем в localStorage в случае ошибки
-      saveUserDataToLocalStorage();
+      throw error; // Пробрасываем ошибку, так как Firebase обязателен
     }
   } else {
-    // В offline режиме сохраняем только в localStorage
-    saveUserDataToLocalStorage();
+    throw new Error('Firestore не инициализирован');
   }
 }
 
@@ -1432,7 +1279,6 @@ function getDocRef(collectionPath, docId) {
 window.firebaseInitPromise = null;
 window.firebaseInitialized = false;
 window.firebaseInitFailed = false;
-window.offlineMode = false;
 
 // Функция динамической загрузки Firebase модулей с fallback
 async function loadFirebaseModules() {
@@ -1473,9 +1319,8 @@ async function loadFirebaseModules() {
       error.message.includes('NetworkError') ||
       error.name === 'TypeError'
     )) {
-      console.warn("⚠️ Обнаружена проблема с CORS или сетью. Переходим в offline режим.");
-      window.offlineMode = true;
-      throw new Error('OFFLINE_MODE');
+      console.error("❌ Обнаружена проблема с CORS или сетью. Firebase недоступен.");
+      throw new Error('Не удалось загрузить Firebase модули. Проверьте подключение к интернету.');
     }
     
     throw error;
@@ -1538,13 +1383,7 @@ async function initFirebase() {
         appModule = modules.appModule;
         firestoreModule = modules.firestoreModule;
       } catch (loadError) {
-        if (loadError.message === 'OFFLINE_MODE') {
-          // Переходим в offline режим
-          window.offlineMode = true;
-          window.firebaseInitFailed = true;
-          console.warn("⚠️ Firebase недоступен, приложение работает в offline режиме");
-          return false;
-        }
+        // Firebase обязателен, не переходим в offline режим
         throw loadError;
       }
       
@@ -1662,7 +1501,6 @@ async function initFirebase() {
       
       window.firebaseInitialized = true;
       window.firebaseInitFailed = false;
-      window.offlineMode = false;
       console.log("✅ Firebase инициализация завершена успешно");
       return true;
       
@@ -1681,12 +1519,11 @@ async function initFirebase() {
         error.message.includes('CORS') ||
         error.message.includes('NetworkError')
       )) {
-        console.error("⚠️ Проблема с загрузкой модулей Firebase. Проверьте:");
+        console.error("❌ Проблема с загрузкой модулей Firebase. Проверьте:");
         console.error("  1. Подключение к интернету");
         console.error("  2. Доступность CDN Firebase");
         console.error("  3. Блокировку скриптов браузером или расширениями");
         console.error("  4. CORS политики в Telegram Web App");
-        window.offlineMode = true;
       }
       
       window.db = null;
@@ -1899,95 +1736,6 @@ function getTestUserData() {
     };
 }
 
-// Функция загрузки данных пользователя в offline режиме
-async function loadUserDataOffline(userInfo) {
-    console.log("📴 Загрузка данных в offline режиме");
-    
-    try {
-        // Пытаемся загрузить данные из localStorage
-        const savedDataKey = `userData_${userInfo.userId}`;
-        const savedData = localStorage.getItem(savedDataKey);
-        
-        if (savedData) {
-            try {
-                window.userData = JSON.parse(savedData);
-                console.log("✅ Данные загружены из localStorage");
-                
-                // Восстанавливаем энергию на основе времени
-                await updateEnergy();
-                
-                updateUI();
-                renderShop();
-                updateReferralsUI();
-                
-                hideLoading();
-                showContent();
-                
-                const preloader = document.getElementById('preloader');
-                if (preloader) preloader.style.display = 'none';
-                
-                // Показываем предупреждение об offline режиме
-                showError('⚠️ Работа в offline режиме. Данные загружены из кэша. Некоторые функции могут быть недоступны.');
-                
-                return;
-            } catch (parseError) {
-                console.error("Ошибка парсинга сохраненных данных:", parseError);
-            }
-        }
-        
-        // Если нет сохраненных данных, создаем новые
-        console.log("🆕 Создание новых данных в offline режиме");
-        window.userData = {
-            userId: userInfo.userId,
-            firstName: userInfo.firstName,
-            username: userInfo.username,
-            photoUrl: userInfo.photoUrl || '',
-            balance: 0,
-            totalClicks: 0,
-            perClickValue: 1,
-            passiveIncome: 0,
-            upgrades: {},
-            referrals: [],
-            referralsEarned: 0,
-            invitedBy: null,
-            energy: 1000,
-            maxEnergy: 1000,
-            energyPerHour: 100,
-            totalEarned: 0,
-            weeklyEarned: 0,
-            leaderboardVisible: true,
-            lastEnergyUpdate: new Date().toISOString(),
-            lastWeeklyReset: new Date().toISOString(),
-            createdAt: new Date().toISOString(),
-            lastActive: new Date().toISOString()
-        };
-        
-        // Сохраняем в localStorage
-        try {
-            localStorage.setItem(savedDataKey, JSON.stringify(window.userData));
-        } catch (storageError) {
-            console.warn("Не удалось сохранить данные в localStorage:", storageError);
-        }
-        
-        recalculateStats();
-        updateUI();
-        renderShop();
-        updateReferralsUI();
-        
-        hideLoading();
-        showContent();
-        
-        const preloader = document.getElementById('preloader');
-        if (preloader) preloader.style.display = 'none';
-        
-        showError('⚠️ Работа в offline режиме. Данные не будут синхронизироваться с сервером.');
-        
-    } catch (error) {
-        console.error("Ошибка загрузки данных в offline режиме:", error);
-        showError('Ошибка загрузки данных в offline режиме. Попробуйте перезагрузить страницу.');
-        hideLoading();
-    }
-}
 
 // Функция загрузки данных пользователя
 async function loadUserData() {
@@ -2003,16 +1751,9 @@ async function loadUserData() {
             await initFirebase();
         } catch (error) {
             console.error("Ошибка инициализации Firebase в loadUserData:", error);
-            
-            // Если это offline режим, продолжаем работу с локальными данными
-            if (window.offlineMode) {
-                console.warn("⚠️ Работа в offline режиме - используем локальные данные");
-                // Продолжаем работу без Firebase
-            } else {
-                showError(`Ошибка инициализации Firebase: ${error.message || error}`);
-                hideLoading();
-                return;
-            }
+            showError(`Ошибка инициализации Firebase: ${error.message || error}. Приложение требует подключения к Firebase.`);
+            hideLoading();
+            return;
         }
     } else if (window.firebaseInitPromise) {
         // Ждем завершения инициализации
@@ -2021,26 +1762,17 @@ async function loadUserData() {
             await window.firebaseInitPromise;
         } catch (error) {
             console.error("Ошибка при ожидании инициализации Firebase:", error);
-            if (!window.offlineMode) {
-                showError(`Ошибка инициализации Firebase: ${error.message || error}`);
-                hideLoading();
-                return;
-            }
+            showError(`Ошибка инициализации Firebase: ${error.message || error}. Приложение требует подключения к Firebase.`);
+            hideLoading();
+            return;
         }
     }
     
-    // Проверяем, доступен ли Firestore (если не в offline режиме)
-    if (!window.offlineMode && !window.db) {
+    // Проверяем, доступен ли Firestore (обязательно)
+    if (!window.db || !window.firebaseFirestore) {
         console.error("Firestore not initialized!");
         showError('Ошибка: Firestore не был инициализирован. Проверьте конфигурацию Firebase.');
         hideLoading();
-        return;
-    }
-    
-    // Если в offline режиме, используем локальные данные
-    if (window.offlineMode) {
-        console.log("📴 Работа в offline режиме - загрузка локальных данных");
-        await loadUserDataOffline(userInfo);
         return;
     }
     
@@ -2206,16 +1938,10 @@ async function loadUserData() {
                         console.log("✅ Повторный запрос выполнен успешно, документ существует:", userDoc.exists());
                     } catch (retryError) {
                         console.error("❌ Ошибка при повторной попытке:", retryError);
-                        // Если не удалось, переходим в offline режим
-                        window.offlineMode = true;
-                        updateConnectionStatus('offline');
-                        throw new Error(`Не удалось подключиться к Firestore. Работаем в offline режиме.`);
+                        throw new Error(`Не удалось подключиться к Firestore. Проверьте подключение к интернету.`);
                     }
                 } else {
-                    // Если enableNetwork недоступен, переходим в offline режим
-                    window.offlineMode = true;
-                    updateConnectionStatus('offline');
-                    throw new Error(`Firestore в offline режиме. Работаем локально.`);
+                    throw new Error(`Firestore недоступен. Проверьте подключение к интернету.`);
                 }
             } else {
                 // Другие ошибки
@@ -2443,32 +2169,6 @@ async function loadUserData() {
             stack: error.stack
         });
         
-        // Проверяем, является ли это ошибкой offline режима
-        const isOfflineError = error.message && (
-            error.message.includes('client is offline') ||
-            error.message.includes('Failed to get document because the client is offline') ||
-            error.message.includes('Работаем в offline режиме') ||
-            error.message.includes('Работаем локально') ||
-            error.code === 'unavailable'
-        );
-        
-        if (isOfflineError) {
-            // Переходим в offline режим и загружаем данные из localStorage
-            console.log("📴 Переход в offline режим из-за ошибки подключения");
-            window.offlineMode = true;
-            updateConnectionStatus('offline');
-            
-            // Пытаемся загрузить данные из localStorage
-            try {
-                await loadUserDataOffline(userInfo);
-                return; // Выходим, так как данные загружены в offline режиме
-            } catch (offlineError) {
-                console.error("Ошибка загрузки данных в offline режиме:", offlineError);
-                showError('Не удалось загрузить данные. Проверьте подключение к интернету.');
-                hideLoading();
-                return;
-            }
-        }
         
         // Более детальное сообщение об ошибке для других случаев
         let errorMessage = 'Ошибка соединения с базой данных. ';
@@ -2636,8 +2336,8 @@ async function handleClick() {
         // Обновляем статистику заработанного
         await updateEarnedStats(perClickValue);
         
-        // Сохраняем в Firebase (если не в offline режиме)
-        if (!window.offlineMode && window.db && window.firebaseFirestore) {
+        // Сохраняем в Firebase
+        if (window.db && window.firebaseFirestore) {
             try {
                 const userId = window.userData.userId.toString();
                 const userRef = getDocRef('users', userId);
@@ -2650,21 +2350,18 @@ async function handleClick() {
                 });
                 console.log("✅ Данные сохранены в Firebase");
             } catch (firebaseError) {
-                console.warn("⚠️ Ошибка сохранения в Firebase, сохраняем локально:", firebaseError);
-                // Сохраняем в localStorage в случае ошибки
-                saveUserDataToLocalStorage();
+                console.error("❌ Ошибка сохранения в Firebase:", firebaseError);
+                throw firebaseError; // Пробрасываем ошибку, так как Firebase обязателен
             }
         } else {
-            // В offline режиме сохраняем только в localStorage
-            saveUserDataToLocalStorage();
+            throw new Error('Firestore не инициализирован');
         }
         
         console.log("handleClick: После клика:", { 
             balance: window.userData.balance, 
             totalClicks: window.userData.totalClicks,
             energy: window.userData.energy,
-            increment: perClickValue,
-            offlineMode: window.offlineMode
+            increment: perClickValue
         });
         
         // Обновляем UI
@@ -2936,22 +2633,16 @@ async function initApp() {
             console.log('⚠️ Telegram WebApp не обнаружен - режим разработки');
         }
         
-        // 4. Инициализация Firebase (модульный подход v9+) с автоматическим восстановлением
-        // Пытаемся инициализировать Firebase, но не прерываем выполнение в offline режиме
+        // 4. Инициализация Firebase (модульный подход v9+) - обязательна
         let firebaseInitialized = false;
         try {
             await retryFirebaseInit(window.maxRetryAttempts, window.retryDelay);
-            if (window.offlineMode) {
-                console.log("⚠️ Firebase недоступен, работаем в offline режиме");
-            } else if (!window.db || !window.firebaseFirestore) {
-                console.error("❌ Firestore не был инициализирован");
-                // Не прерываем выполнение, продолжаем в offline режиме
-                window.offlineMode = true;
-            } else {
-                firebaseInitialized = true;
-                console.log("✅ Firebase initialized successfully");
-                console.log("✅ Firestore модуль загружен:", Object.keys(window.firebaseFirestore));
+            if (!window.db || !window.firebaseFirestore) {
+                throw new Error("Firestore не был инициализирован");
             }
+            firebaseInitialized = true;
+            console.log("✅ Firebase initialized successfully");
+            console.log("✅ Firestore модуль загружен:", Object.keys(window.firebaseFirestore));
         } catch (error) {
             console.error("❌ Firebase error:", error);
             console.error("Детали ошибки:", {
@@ -2961,25 +2652,20 @@ async function initApp() {
                 stack: error.stack
             });
             
-            // Если это не критическая ошибка или мы в offline режиме, продолжаем
-            if (error.message === 'OFFLINE_MODE' || window.offlineMode) {
-                console.log("⚠️ Продолжаем работу в offline режиме");
-                window.offlineMode = true;
-            } else {
-                // Показываем предупреждение, но не прерываем выполнение
-                console.warn("⚠️ Firebase недоступен, переходим в offline режим");
-                window.offlineMode = true;
-            }
+            // Firebase обязателен - прерываем выполнение
+            showError(`Ошибка инициализации Firebase: ${error.message || error}. Приложение требует подключения к Firebase.`);
+            hideLoading();
+            return;
         }
         
         // 4.5. Настройка мониторинга сети и синхронизации
         setupNetworkMonitoring();
         
-        // 5. Загрузка данных пользователя (работает как с Firebase, так и в offline режиме)
+        // 5. Загрузка данных пользователя (требует Firebase)
         await loadUserData();
         
         // 6. Проверка индексов Firestore (только если Firebase инициализирован)
-        if (firebaseInitialized && !window.offlineMode) {
+        if (firebaseInitialized) {
             try {
                 await checkAndCreateIndexes();
             } catch (indexError) {
@@ -3043,7 +2729,6 @@ window.debugUtils = {
       } : null,
       firebase: {
         initialized: window.firebaseInitialized,
-        offlineMode: window.offlineMode,
         connectionStatus: window.connectionStatus,
         retryCount: window.firebaseRetryCount
       },
@@ -3082,27 +2767,10 @@ window.debugUtils = {
     console.log("🗑️ Кэш очищен");
   },
   
-  // Принудительная синхронизация
-  forceSync: async () => {
-    if (window.offlineMode) {
-      console.warn("⚠️ Невозможно синхронизировать в offline режиме");
-      return false;
-    }
-    try {
-      await syncDataFromLocalStorage();
-      console.log("✅ Принудительная синхронизация завершена");
-      return true;
-    } catch (error) {
-      console.error("❌ Ошибка принудительной синхронизации:", error);
-      return false;
-    }
-  },
-  
   // Переинициализация Firebase
   reinitFirebase: async () => {
     try {
       window.firebaseInitialized = false;
-      window.offlineMode = false;
       await retryFirebaseInit();
       console.log("✅ Firebase переинициализирован");
       return true;
