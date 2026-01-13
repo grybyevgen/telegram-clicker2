@@ -112,9 +112,14 @@ function renderShop() {
   const shopTab = document.getElementById('shop-tab');
   if (!shopTab) return;
   
-  if (!shopItemsEl) return;
+  // Используем глобальную переменную или получаем элемент
+  const shopItems = window.shopItemsEl || document.getElementById('shop-items');
+  if (!shopItems) {
+    console.error('shop-items element not found');
+    return;
+  }
   
-  shopItemsEl.innerHTML = '';
+  shopItems.innerHTML = '';
   
   window.upgrades.forEach(upgrade => {
     const userUpgrades = window.userData?.upgrades || {};
@@ -138,11 +143,11 @@ function renderShop() {
     `;
     card.appendChild(button);
     
-    shopItemsEl.appendChild(card);
+    shopItems.appendChild(card);
   });
   
   // Назначаем обработчики кнопок
-  shopItemsEl.querySelectorAll('.buy-btn').forEach(btn => {
+  shopItems.querySelectorAll('.buy-btn').forEach(btn => {
     btn.addEventListener('click', function() {
       const upgradeId = this.getAttribute('data-id');
       buyUpgrade(upgradeId);
@@ -464,6 +469,15 @@ async function processReferralParam() {
     if (startParam && startParam.startsWith('ref_')) {
       refId = startParam.replace('ref_', '');
       console.log('✅ Реферальный параметр найден в Telegram start_param:', refId);
+    }
+  }
+  
+  // В десктопной версии start_param может быть только в initData строке
+  if (!refId && tg && tg.initData) {
+    const parsedData = parseAllInitData(tg.initData);
+    if (parsedData && parsedData.start_param && parsedData.start_param.startsWith('ref_')) {
+      refId = parsedData.start_param.replace('ref_', '');
+      console.log('✅ Реферальный параметр найден в parsed initData:', refId);
     }
   }
   
@@ -1050,34 +1064,142 @@ function initFirebase() {
 }
 
 // Функция проверки, запущено ли приложение в Telegram
+// Упрощенная версия: используем только проверку наличия initData, без проверки platform
 function isTelegramWebApp() {
     // Проверяем наличие Telegram Web App API
     if (!window.Telegram || !window.Telegram.WebApp) {
         return false;
     }
     
-    const tg = window.Telegram.WebApp;
-    
-    // Проверяем, что мы действительно в Telegram (не в обычном браузере)
-    // В Telegram всегда есть platform, и он не равен 'unknown'
-    if (tg.platform && tg.platform !== 'unknown' && tg.platform !== 'web') {
-        return true;
+    try {
+        const tg = window.Telegram.WebApp;
+        
+        // Проверяем наличие initData или initDataUnsafe - это основной признак Telegram Web App
+        // Работает как в мобильной, так и в десктопной версии
+        if (tg && (tg.initData || tg.initDataUnsafe)) {
+            return true;
+        }
+        
+        return false;
+    } catch (error) {
+        console.warn('Ошибка проверки Telegram WebApp:', error);
+        return false;
     }
-    
-    // Дополнительная проверка: если есть initDataUnsafe, значит мы в Telegram
-    if (tg.initDataUnsafe) {
-        return true;
-    }
-    
-    return false;
 }
 
 // Функция получения экземпляра Telegram Web App
 function getTelegramWebApp() {
-    if (window.Telegram && window.Telegram.WebApp) {
-        return window.Telegram.WebApp;
+    // Проверяем, что Telegram SDK загружен
+    if (!window.Telegram) {
+        console.warn('Telegram SDK не загружен');
+        return null;
     }
-    return null;
+    
+    // Проверяем наличие WebApp объекта
+    if (!window.Telegram.WebApp) {
+        console.warn('Telegram.WebApp не доступен');
+        return null;
+    }
+    
+    return window.Telegram.WebApp;
+}
+
+// Функция ожидания загрузки Telegram SDK
+async function waitForTelegram(maxWaitTime = 5000) {
+    const startTime = Date.now();
+    
+    // Если Telegram уже загружен, возвращаем сразу
+    if (window.Telegram && window.Telegram.WebApp) {
+        return true;
+    }
+    
+    // Ждем загрузки Telegram SDK
+    while (Date.now() - startTime < maxWaitTime) {
+        if (window.Telegram && window.Telegram.WebApp) {
+            console.log('✅ Telegram SDK загружен');
+            return true;
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
+    console.warn('⚠️ Telegram SDK не загружен в течение', maxWaitTime, 'мс');
+    return false;
+}
+
+// Безопасная обертка для вызовов Telegram API
+function safeTelegramCall(callback) {
+    try {
+        const tg = getTelegramWebApp();
+        if (!tg) return null;
+        return callback(tg);
+    } catch (error) {
+        console.error('Ошибка вызова Telegram API:', error);
+        return null;
+    }
+}
+
+// Функция парсинга всех данных из initData строки
+function parseAllInitData(initDataString) {
+    try {
+        if (!initDataString || typeof initDataString !== 'string') {
+            return null;
+        }
+        
+        const params = new URLSearchParams(initDataString);
+        const result = {};
+        
+        // Парсим все параметры
+        params.forEach((value, key) => {
+            if (key === 'user' || key === 'receiver' || key === 'chat') {
+                try {
+                    result[key] = JSON.parse(decodeURIComponent(value));
+                } catch (e) {
+                    console.error('Ошибка парсинга JSON для', key, e);
+                    result[key] = value;
+                }
+            } else {
+                result[key] = decodeURIComponent(value);
+            }
+        });
+        
+        return result;
+    } catch (error) {
+        console.error('Ошибка парсинга initData:', error);
+        return null;
+    }
+}
+
+// Функция парсинга initData строки для получения данных пользователя
+function parseInitData(initDataString) {
+    try {
+        if (!initDataString || typeof initDataString !== 'string') {
+            return null;
+        }
+        
+        // Используем новую функцию парсинга
+        const parsedData = parseAllInitData(initDataString);
+        if (parsedData && parsedData.user) {
+            return parsedData.user;
+        }
+        
+        // Fallback для старого формата
+        const params = new URLSearchParams(initDataString);
+        const userParam = params.get('user');
+        
+        if (!userParam) return null;
+        
+        // Декодируем и парсим JSON
+        try {
+            const decoded = decodeURIComponent(userParam);
+            return JSON.parse(decoded);
+        } catch (e) {
+            console.error('Ошибка парсинга user данных:', e);
+            return null;
+        }
+    } catch (error) {
+        console.error('Общая ошибка парсинга initData:', error);
+        return null;
+    }
 }
 
 // Элементы DOM
@@ -1091,6 +1213,8 @@ const devModeIndicator = document.getElementById('devModeIndicator');
 const perClickEl = document.getElementById('per-click');
 const passiveIncomeEl = document.getElementById('passive-income');
 const shopItemsEl = document.getElementById('shop-items');
+// Сохраняем в window для глобального доступа
+window.shopItemsEl = shopItemsEl;
 
 // Функция получения тестовых данных пользователя
 function getTestUserData() {
@@ -1135,18 +1259,32 @@ async function loadUserData() {
         }
         
         // Инициализируем Telegram Web App (ready() уже вызван в initApp, но для надежности вызываем еще раз)
-        tg.ready();
-        tg.expand();
+        safeTelegramCall((t) => {
+            t.ready();
+            t.expand();
+            return true;
+        });
         
-        // Получаем данные пользователя из initDataUnsafe
-        // Это единственный правильный способ согласно документации Telegram
+        // Получаем данные пользователя из initDataUnsafe (приоритетный способ)
+        // Если initDataUnsafe недоступен (например, в десктопной версии), парсим initData строку
         let tgUser = null;
         
+        // Способ 1: Используем initDataUnsafe (работает в мобильной версии)
         if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
             tgUser = tg.initDataUnsafe.user;
+            console.log("✅ Данные пользователя получены из initDataUnsafe");
         }
         
-        // Если данные пользователя еще не загружены, ждем немного
+        // Способ 2: Парсим initData строку (для десктопной версии и fallback)
+        if (!tgUser && tg.initData) {
+            console.log("Попытка парсинга initData строки...");
+            tgUser = parseInitData(tg.initData);
+            if (tgUser) {
+                console.log("✅ Данные пользователя получены из initData строки");
+            }
+        }
+        
+        // Если данные пользователя еще не загружены, ждем немного и пробуем снова
         if (!tgUser) {
             console.warn("Данные пользователя Telegram еще не загружены, ждем...");
             
@@ -1154,10 +1292,23 @@ async function loadUserData() {
             let attempts = 0;
             while (attempts < 20 && !tgUser) {
                 await new Promise(resolve => setTimeout(resolve, 100));
+                
+                // Пробуем initDataUnsafe снова
                 if (tg.initDataUnsafe && tg.initDataUnsafe.user) {
                     tgUser = tg.initDataUnsafe.user;
+                    console.log("✅ Данные пользователя получены из initDataUnsafe после ожидания");
                     break;
                 }
+                
+                // Пробуем парсить initData снова
+                if (!tgUser && tg.initData) {
+                    tgUser = parseInitData(tg.initData);
+                    if (tgUser) {
+                        console.log("✅ Данные пользователя получены из initData строки после ожидания");
+                        break;
+                    }
+                }
+                
                 attempts++;
             }
         }
@@ -1176,17 +1327,18 @@ async function loadUserData() {
                 platform: tg.platform,
                 version: tg.version,
                 colorScheme: tg.colorScheme,
-                initDataUnsafe: {
+                initDataUnsafe: tg.initDataUnsafe ? {
                     query_id: tg.initDataUnsafe.query_id,
                     auth_date: tg.initDataUnsafe.auth_date,
                     hash: tg.initDataUnsafe.hash ? 'present' : 'missing',
                     start_param: tg.initDataUnsafe.start_param
-                }
+                } : 'недоступен'
             });
         } else {
             console.error("❌ Не удалось получить данные пользователя Telegram");
             console.log("Доступные данные initDataUnsafe:", tg.initDataUnsafe);
-            console.log("Платформа:", tg.platform);
+            console.log("Доступна initData строка:", !!tg.initData, tg.initData ? tg.initData.substring(0, 100) + '...' : 'нет');
+            console.log("Платформа:", tg.platform || 'не указана');
             showError('Ошибка: не удалось получить данные пользователя Telegram. Попробуйте перезапустить приложение.');
             return;
         }
@@ -1575,14 +1727,16 @@ async function handleClick() {
         
         // Вибрация при клике (только в Telegram, не в режиме разработки)
         if (!window.isDevMode) {
-            const tg = getTelegramWebApp();
-            if (tg && tg.HapticFeedback) {
-                try {
-                    tg.HapticFeedback.impactOccurred('light');
-                } catch (error) {
-                    console.warn('Ошибка вибрации:', error);
+            safeTelegramCall((tg) => {
+                if (tg.HapticFeedback) {
+                    try {
+                        tg.HapticFeedback.impactOccurred('light');
+                    } catch (error) {
+                        console.warn('Ошибка вибрации:', error);
+                    }
                 }
-            }
+                return true;
+            });
         }
         
         console.log(`handleClick: Клик выполнен! Баланс: ${window.userData.balance}, Кликов: ${window.userData.totalClicks}, Энергия: ${window.userData.energy}`);
@@ -1649,71 +1803,87 @@ async function initApp() {
             return;
         }
         
-        // 2. Инициализация Telegram Web App (если доступен)
+        // 2. Ожидание загрузки Telegram SDK (для десктопной версии может потребоваться время)
+        await waitForTelegram(5000);
+        
+        // 3. Инициализация Telegram Web App (если доступен)
         // Важно: инициализация должна происходить ДО загрузки данных пользователя
         const tg = getTelegramWebApp();
         if (tg) {
-            // Вызываем ready() - это обязательный метод для инициализации
-            tg.ready();
-            
-            // Разворачиваем приложение на весь экран
-            tg.expand();
-            
-            // Настраиваем тему Telegram
-            if (tg.colorScheme) {
-                document.documentElement.setAttribute('data-theme', tg.colorScheme);
-                // Также можно установить цвет фона
-                if (tg.backgroundColor) {
-                    document.body.style.backgroundColor = tg.backgroundColor;
+            safeTelegramCall((t) => {
+                // Вызываем ready() - это обязательный метод для инициализации
+                t.ready();
+                
+                // Разворачиваем приложение на весь экран
+                t.expand();
+                
+                // Настраиваем тему Telegram
+                if (t.colorScheme) {
+                    document.documentElement.setAttribute('data-theme', t.colorScheme);
+                    // Также можно установить цвет фона
+                    if (t.backgroundColor) {
+                        document.body.style.backgroundColor = t.backgroundColor;
+                    }
                 }
-            }
-            
-            // Обработчик изменения темы
-            tg.onEvent('themeChanged', () => {
-                if (tg.colorScheme) {
-                    document.documentElement.setAttribute('data-theme', tg.colorScheme);
+                
+                // Обработчик изменения темы
+                try {
+                    t.onEvent('themeChanged', () => {
+                        if (t.colorScheme) {
+                            document.documentElement.setAttribute('data-theme', t.colorScheme);
+                        }
+                        if (t.backgroundColor) {
+                            document.body.style.backgroundColor = t.backgroundColor;
+                        }
+                    });
+                } catch (e) {
+                    console.warn('Ошибка установки обработчика themeChanged:', e);
                 }
-                if (tg.backgroundColor) {
-                    document.body.style.backgroundColor = tg.backgroundColor;
+                
+                // Обработчик изменения размера окна
+                try {
+                    t.onEvent('viewportChanged', () => {
+                        // Можно обработать изменение размера окна
+                        console.log('Viewport changed:', t.viewportHeight);
+                    });
+                } catch (e) {
+                    console.warn('Ошибка установки обработчика viewportChanged:', e);
                 }
+                
+                // Включаем вибрацию при клике (если поддерживается)
+                if (t.HapticFeedback) {
+                    // Будет использоваться в handleClick
+                }
+                
+                console.log('✅ Telegram WebApp инициализирован');
+                console.log('Платформа:', t.platform || 'не указана');
+                console.log('Версия:', t.version || 'не указана');
+                console.log('Цветовая схема:', t.colorScheme || 'не указана');
+                console.log('Высота viewport:', t.viewportHeight || 'не указана');
+                console.log('InitData доступен:', !!t.initData);
+                console.log('InitDataUnsafe доступен:', !!t.initDataUnsafe);
+                return true;
             });
-            
-            // Обработчик изменения размера окна
-            tg.onEvent('viewportChanged', () => {
-                // Можно обработать изменение размера окна
-                console.log('Viewport changed:', tg.viewportHeight);
-            });
-            
-            // Включаем вибрацию при клике (если поддерживается)
-            if (tg.HapticFeedback) {
-                // Будет использоваться в handleClick
-            }
-            
-            console.log('✅ Telegram WebApp инициализирован');
-            console.log('Платформа:', tg.platform);
-            console.log('Версия:', tg.version);
-            console.log('Цветовая схема:', tg.colorScheme);
-            console.log('Высота viewport:', tg.viewportHeight);
         } else {
             console.log('⚠️ Telegram WebApp не обнаружен - режим разработки');
         }
         
-        // 3. Режим работы определится в loadUserData()
+        // 4. Режим работы определится в loadUserData()
         
-        // 4. Загрузка данных пользователя (после инициализации Firebase)
+        // 5. Загрузка данных пользователя (после инициализации Firebase)
         await loadUserData();
         
-        // 5. Проверка индексов Firestore (после загрузки данных пользователя)
+        // 6. Проверка индексов Firestore (после загрузки данных пользователя)
         await checkAndCreateIndexes();
         
-        // 6. Инициализация навигации (ДО запуска пассивного дохода)
+        // 7. Инициализация навигации (ДО запуска пассивного дохода)
         initNavigation();
         
-        // 7. Настройка реферальной системы
+        // 8. Настройка реферальной системы
         setupCopyLinkButton();
         await processReferralParam();
         
-        // 8. Запускаем интервал для обновления энергии (каждую минуту)
+        // 9. Запускаем интервал для обновления энергии (каждую минуту)
         if (window.energyUpdateInterval) {
             clearInterval(window.energyUpdateInterval);
         }
