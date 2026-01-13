@@ -41,6 +41,21 @@ window.userData = null;
 window.db = null;
 window.passiveIncomeInterval = null;
 window.energyUpdateInterval = null;
+window.syncInProgress = false;
+window.lastSyncTime = null;
+window.connectionStatus = 'unknown'; // 'online', 'offline', 'syncing', 'unknown'
+window.firebaseRetryCount = 0;
+window.maxRetryAttempts = 3;
+window.retryDelay = 5000; // 5 секунд
+window.cache = {
+  shop: null,
+  leaderboard: {
+    global: null,
+    friends: null,
+    weekly: null
+  },
+  lastUpdate: {}
+};
 
 console.log("App.js loading...");
 
@@ -105,7 +120,7 @@ window.upgrades = [
   }
 ];
 
-// ФУНКЦИЯ: Рендер магазина
+// ФУНКЦИЯ: Рендер магазина с кэшированием и lazy loading
 function renderShop() {
   console.log("renderShop called");
   const shopTab = document.getElementById('shop-tab');
@@ -118,7 +133,27 @@ function renderShop() {
     return;
   }
   
-  shopItems.innerHTML = '';
+  // Проверяем кэш (кэш действителен 5 минут)
+  const cacheKey = 'shop';
+  const cacheTime = 5 * 60 * 1000; // 5 минут
+  const cached = window.cache.shop;
+  const now = Date.now();
+  
+  if (cached && (now - cached.timestamp < cacheTime)) {
+    console.log("📦 Используем кэшированные данные магазина");
+    shopItems.innerHTML = cached.html;
+    // Восстанавливаем обработчики событий
+    shopItems.querySelectorAll('.buy-btn').forEach(btn => {
+      btn.addEventListener('click', function() {
+        const upgradeId = this.getAttribute('data-id');
+        buyUpgrade(upgradeId);
+      });
+    });
+    return;
+  }
+  
+  // Генерируем HTML
+  let html = '';
   
   window.upgrades.forEach(upgrade => {
     const userUpgrades = window.userData?.upgrades || {};
@@ -142,8 +177,16 @@ function renderShop() {
     `;
     card.appendChild(button);
     
-    shopItems.appendChild(card);
+    html += card.outerHTML;
   });
+  
+  // Сохраняем в кэш
+  window.cache.shop = {
+    html: html,
+    timestamp: now
+  };
+  
+  shopItems.innerHTML = html;
   
   // Назначаем обработчики кнопок
   shopItems.querySelectorAll('.buy-btn').forEach(btn => {
@@ -154,6 +197,206 @@ function renderShop() {
   });
 }
 
+// Функция сохранения данных в localStorage (для offline режима)
+function saveUserDataToLocalStorage() {
+  if (!window.userData || !window.userData.userId) return;
+  
+  try {
+    const savedDataKey = `userData_${window.userData.userId}`;
+    // Преобразуем Timestamp объекты в строки для сохранения
+    const dataToSave = JSON.parse(JSON.stringify(window.userData, (key, value) => {
+      // Обрабатываем Timestamp объекты
+      if (value && typeof value === 'object' && 'seconds' in value) {
+        return new Date(value.seconds * 1000).toISOString();
+      }
+      return value;
+    }));
+    // Добавляем метку времени последнего изменения
+    dataToSave._lastModified = new Date().toISOString();
+    localStorage.setItem(savedDataKey, JSON.stringify(dataToSave));
+    console.log("💾 Данные сохранены в localStorage");
+  } catch (error) {
+    console.warn("⚠️ Не удалось сохранить данные в localStorage:", error);
+  }
+}
+
+// Функция синхронизации данных из localStorage с Firebase
+async function syncDataFromLocalStorage() {
+  if (window.syncInProgress || window.offlineMode || !window.db || !window.firebaseFirestore) {
+    return;
+  }
+  
+  if (!window.userData || !window.userData.userId) {
+    return;
+  }
+  
+  try {
+    window.syncInProgress = true;
+    updateConnectionStatus('syncing');
+    
+    const savedDataKey = `userData_${window.userData.userId}`;
+    const savedDataStr = localStorage.getItem(savedDataKey);
+    
+    if (!savedDataStr) {
+      window.syncInProgress = false;
+      updateConnectionStatus('online');
+      return;
+    }
+    
+    const savedData = JSON.parse(savedDataStr);
+    const lastModified = savedData._lastModified ? new Date(savedData._lastModified) : null;
+    
+    // Загружаем данные из Firebase для сравнения
+    const userRef = getDocRef('users', window.userData.userId);
+    const firebaseDoc = await window.firebaseFirestore.getDoc(userRef);
+    
+    if (!firebaseDoc.exists()) {
+      // Если документа нет в Firebase, создаем его из localStorage
+      delete savedData._lastModified;
+      await window.firebaseFirestore.setDoc(userRef, {
+        ...savedData,
+        lastActive: window.firebaseFirestore.serverTimestamp()
+      });
+      console.log("✅ Данные синхронизированы: создан новый документ в Firebase");
+    } else {
+      const firebaseData = firebaseDoc.data();
+      const firebaseLastActive = firebaseData.lastActive;
+      
+      // Сравниваем время последнего изменения
+      // Если локальные данные новее, обновляем Firebase
+      if (lastModified && (!firebaseLastActive || lastModified > firebaseLastActive.toDate())) {
+        delete savedData._lastModified;
+        await window.firebaseFirestore.updateDoc(userRef, {
+          ...savedData,
+          lastActive: window.firebaseFirestore.serverTimestamp()
+        });
+        console.log("✅ Данные синхронизированы: локальные данные обновлены в Firebase");
+      } else {
+        // Если данные в Firebase новее, обновляем локальные данные
+        window.userData = { ...firebaseData, userId: window.userData.userId };
+        saveUserDataToLocalStorage();
+        updateUI();
+        console.log("✅ Данные синхронизированы: Firebase данные загружены локально");
+      }
+    }
+    
+    window.lastSyncTime = new Date();
+    updateConnectionStatus('online');
+    
+  } catch (error) {
+    console.error("❌ Ошибка синхронизации данных:", error);
+    updateConnectionStatus('offline');
+  } finally {
+    window.syncInProgress = false;
+  }
+}
+
+// Функция обновления статуса соединения и отображения уведомлений
+function updateConnectionStatus(status) {
+  window.connectionStatus = status;
+  
+  // Удаляем старое уведомление если есть
+  let statusNotification = document.getElementById('connection-status');
+  if (!statusNotification) {
+    statusNotification = document.createElement('div');
+    statusNotification.id = 'connection-status';
+    statusNotification.style.cssText = `
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      padding: 12px;
+      text-align: center;
+      font-weight: 600;
+      font-size: 14px;
+      z-index: 10000;
+      transition: all 0.3s ease;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+    `;
+    document.body.appendChild(statusNotification);
+  }
+  
+  switch (status) {
+    case 'online':
+      statusNotification.textContent = '✅ Онлайн - данные синхронизируются';
+      statusNotification.style.background = '#4CAF50';
+      statusNotification.style.color = '#ffffff';
+      setTimeout(() => {
+        if (statusNotification && window.connectionStatus === 'online') {
+          statusNotification.style.transform = 'translateY(-100%)';
+          setTimeout(() => statusNotification.remove(), 300);
+        }
+      }, 2000);
+      break;
+    case 'offline':
+      statusNotification.textContent = '📴 Офлайн режим - данные сохраняются локально';
+      statusNotification.style.background = '#ff9800';
+      statusNotification.style.color = '#ffffff';
+      break;
+    case 'syncing':
+      statusNotification.textContent = '🔄 Синхронизация данных...';
+      statusNotification.style.background = '#2196F3';
+      statusNotification.style.color = '#ffffff';
+      break;
+    default:
+      statusNotification.style.display = 'none';
+  }
+}
+
+// Мониторинг состояния сети
+function setupNetworkMonitoring() {
+  // Слушаем события online/offline браузера
+  window.addEventListener('online', async () => {
+    console.log("🌐 Соединение восстановлено");
+    updateConnectionStatus('syncing');
+    
+    // Пытаемся переинициализировать Firebase с повторными попытками
+    if (window.offlineMode) {
+      try {
+        await retryFirebaseInit(window.maxRetryAttempts, window.retryDelay);
+        if (window.firebaseInitialized) {
+          window.offlineMode = false;
+          // Синхронизируем данные
+          await syncDataFromLocalStorage();
+        }
+      } catch (error) {
+        console.error("Ошибка переинициализации Firebase:", error);
+        updateConnectionStatus('offline');
+      }
+    } else {
+      await syncDataFromLocalStorage();
+    }
+  });
+  
+  window.addEventListener('offline', () => {
+    console.log("📴 Соединение потеряно");
+    updateConnectionStatus('offline');
+    window.offlineMode = true;
+  });
+  
+  // Периодическая проверка соединения
+  setInterval(async () => {
+    if (navigator.onLine && window.offlineMode && window.db && window.firebaseFirestore) {
+      try {
+        // Пробуем выполнить простой запрос для проверки соединения
+        const testRef = getDocRef('users', window.userData?.userId || 'test');
+        await window.firebaseFirestore.getDoc(testRef);
+        // Если запрос успешен, синхронизируем данные
+        if (window.offlineMode) {
+          window.offlineMode = false;
+          await syncDataFromLocalStorage();
+        }
+      } catch (error) {
+        // Соединение все еще недоступно
+        if (!window.offlineMode) {
+          window.offlineMode = true;
+          updateConnectionStatus('offline');
+        }
+      }
+    }
+  }, 30000); // Проверяем каждые 30 секунд
+}
+
 // ФУНКЦИЯ: Обновление энергии по времени
 async function updateEnergy() {
   if (!window.userData || !window.userData.lastEnergyUpdate) return;
@@ -161,12 +404,15 @@ async function updateEnergy() {
   const now = new Date();
   let lastUpdate;
   
-  // Обрабатываем Timestamp из модульного API
+  // Обрабатываем Timestamp из модульного API или строку из localStorage
   if (window.userData.lastEnergyUpdate && typeof window.userData.lastEnergyUpdate.toDate === 'function') {
     lastUpdate = window.userData.lastEnergyUpdate.toDate();
   } else if (window.userData.lastEnergyUpdate && window.userData.lastEnergyUpdate.seconds) {
     // Если это Timestamp объект с seconds
     lastUpdate = new Date(window.userData.lastEnergyUpdate.seconds * 1000);
+  } else if (typeof window.userData.lastEnergyUpdate === 'string') {
+    // Если это строка из localStorage
+    lastUpdate = new Date(window.userData.lastEnergyUpdate);
   } else {
     lastUpdate = new Date(window.userData.lastEnergyUpdate);
   }
@@ -183,8 +429,8 @@ async function updateEnergy() {
     // Округляем энергию до целых
     window.userData.energy = Math.floor(window.userData.energy);
     
-    // Обновляем в Firestore только если энергия изменилась
-    if (window.userData.energy !== oldEnergy && window.db && window.firebaseFirestore) {
+    // Обновляем в Firestore только если энергия изменилась и не в offline режиме
+    if (window.userData.energy !== oldEnergy && !window.offlineMode && window.db && window.firebaseFirestore) {
       try {
         const userRef = getDocRef('users', window.userData.userId);
         await window.firebaseFirestore.updateDoc(userRef, {
@@ -198,10 +444,16 @@ async function updateEnergy() {
         console.log(`updateEnergy: Энергия обновлена: ${oldEnergy} -> ${window.userData.energy}`);
       } catch (err) {
         console.error('Ошибка обновления энергии:', err);
+        // Сохраняем в localStorage в случае ошибки
+        window.userData.lastEnergyUpdate = now.toISOString();
+        saveUserDataToLocalStorage();
       }
     } else if (window.userData.energy !== oldEnergy) {
-      // Обновляем UI даже если нет подключения к БД
+      // В offline режиме или если нет подключения - сохраняем в localStorage
+      window.userData.lastEnergyUpdate = now.toISOString();
+      saveUserDataToLocalStorage();
       updateEnergyUI();
+      console.log(`updateEnergy (offline): Энергия обновлена: ${oldEnergy} -> ${window.userData.energy}`);
     }
   }
 }
@@ -233,7 +485,7 @@ async function applyPassiveIncome() {
 async function buyUpgrade(upgradeId) {
   console.log("buyUpgrade called:", { upgradeId, balance: window.userData?.balance, upgrades: window.userData?.upgrades });
   
-  if (!window.userData || !window.db) {
+  if (!window.userData) {
     console.error("buyUpgrade: Данные не загружены");
     return;
   }
@@ -296,27 +548,29 @@ async function buyUpgrade(upgradeId) {
     });
   }
   
-  // Сохраняем в Firestore
-  if (!window.firebaseFirestore) {
-    console.error("buyUpgrade: Firebase Firestore модуль не загружен");
-    return;
-  }
-  
-  try {
-    const userRef = getDocRef("users", window.userData.userId);
-    await window.firebaseFirestore.updateDoc(userRef, {
-      balance: window.userData.balance,
-      perClickValue: window.userData.perClickValue,
-      passiveIncome: window.userData.passiveIncome,
-      upgrades: window.userData.upgrades,
-      energy: window.userData.energy,
-      maxEnergy: window.userData.maxEnergy,
-      energyPerHour: window.userData.energyPerHour,
-      lastActive: window.firebaseFirestore.serverTimestamp()
-    });
-  } catch (error) {
-    console.error('buyUpgrade: Ошибка сохранения в Firestore:', error);
-    throw error;
+  // Сохраняем в Firestore (если не в offline режиме)
+  if (!window.offlineMode && window.db && window.firebaseFirestore) {
+    try {
+      const userRef = getDocRef("users", window.userData.userId);
+      await window.firebaseFirestore.updateDoc(userRef, {
+        balance: window.userData.balance,
+        perClickValue: window.userData.perClickValue,
+        passiveIncome: window.userData.passiveIncome,
+        upgrades: window.userData.upgrades,
+        energy: window.userData.energy,
+        maxEnergy: window.userData.maxEnergy,
+        energyPerHour: window.userData.energyPerHour,
+        lastActive: window.firebaseFirestore.serverTimestamp()
+      });
+      console.log("✅ Данные сохранены в Firebase");
+    } catch (error) {
+      console.warn('buyUpgrade: Ошибка сохранения в Firestore, сохраняем локально:', error);
+      // Сохраняем в localStorage в случае ошибки
+      saveUserDataToLocalStorage();
+    }
+  } else {
+    // В offline режиме сохраняем только в localStorage
+    saveUserDataToLocalStorage();
   }
   
   console.log(`buyUpgrade: Куплено ${upgrade.name}, уровень: ${level + 1}, новые значения:`, {
@@ -325,6 +579,19 @@ async function buyUpgrade(upgradeId) {
     energy: window.userData.energy,
     maxEnergy: window.userData.maxEnergy
   });
+  
+  // Вибрация и звук при успешной покупке
+  if (!window.isDevMode) {
+    if (window.telegramHaptic) {
+      window.telegramHaptic.notification('success');
+    }
+    if (window.telegramSound) {
+      window.telegramSound.play('coin');
+    }
+  }
+  
+  // Очищаем кэш магазина при покупке
+  window.cache.shop = null;
   
   updateUI();
   renderShop();
@@ -665,8 +932,8 @@ async function updateEarnedStats(amount) {
   window.userData.totalEarned = (window.userData.totalEarned || 0) + amount;
   window.userData.weeklyEarned = (window.userData.weeklyEarned || 0) + amount;
   
-  // Сохраняем в Firestore
-  if (window.db && window.firebaseFirestore) {
+  // Сохраняем в Firestore (если не в offline режиме)
+  if (!window.offlineMode && window.db && window.firebaseFirestore) {
     try {
       const userRef = getDocRef('users', window.userData.userId);
       await window.firebaseFirestore.updateDoc(userRef, {
@@ -675,7 +942,12 @@ async function updateEarnedStats(amount) {
       });
     } catch (error) {
       console.error('Ошибка обновления статистики заработанного:', error);
+      // Сохраняем в localStorage в случае ошибки
+      saveUserDataToLocalStorage();
     }
+  } else {
+    // В offline режиме сохраняем только в localStorage
+    saveUserDataToLocalStorage();
   }
 }
 
@@ -944,8 +1216,34 @@ function renderLeaderboard(list, elementId, showCrown = true) {
   container.innerHTML = html;
 }
 
-// Загрузка и отображение рейтинга по типу
+// Загрузка и отображение рейтинга по типу с кэшированием и lazy loading
 async function loadAndRenderLeaderboard(type) {
+  // Проверяем кэш (кэш действителен 30 секунд для лидерборда)
+  const cacheTime = 30 * 1000; // 30 секунд
+  const cached = window.cache.leaderboard[type];
+  const now = Date.now();
+  
+  if (cached && (now - cached.timestamp < cacheTime)) {
+    console.log(`📦 Используем кэшированные данные лидерборда: ${type}`);
+    let elementId = '';
+    switch(type) {
+      case 'global':
+        elementId = 'global-leaderboard';
+        break;
+      case 'friends':
+        elementId = 'friends-leaderboard';
+        break;
+      case 'weekly':
+        elementId = 'weekly-leaderboard';
+        break;
+    }
+    if (elementId) {
+      renderLeaderboard(cached.list, elementId);
+      updateUserRank(type, cached.list);
+    }
+    return;
+  }
+  
   let list = [];
   let elementId = '';
   
@@ -963,6 +1261,12 @@ async function loadAndRenderLeaderboard(type) {
       elementId = 'weekly-leaderboard';
       break;
   }
+  
+  // Сохраняем в кэш
+  window.cache.leaderboard[type] = {
+    list: list,
+    timestamp: now
+  };
   
   if (elementId) {
     renderLeaderboard(list, elementId);
@@ -1124,117 +1428,289 @@ function getDocRef(collectionPath, docId) {
   return window.firebaseFirestore.doc(col, docId);
 }
 
-// Функция инициализации Firebase (модульный подход v9+)
-async function initFirebase() {
+// Флаг для отслеживания состояния инициализации Firebase
+window.firebaseInitPromise = null;
+window.firebaseInitialized = false;
+window.firebaseInitFailed = false;
+window.offlineMode = false;
+
+// Функция динамической загрузки Firebase модулей с fallback
+async function loadFirebaseModules() {
+  const firebaseVersion = '10.7.0';
+  const baseUrl = 'https://www.gstatic.com/firebasejs';
+  
+  // Список URL для попыток загрузки (можно добавить альтернативные CDN)
+  const urls = {
+    app: `${baseUrl}/${firebaseVersion}/firebase-app.js`,
+    firestore: `${baseUrl}/${firebaseVersion}/firebase-firestore.js`
+  };
+  
   try {
-    console.log("🔧 Начало инициализации Firebase (модульный подход v9+)...");
+    console.log("📦 Попытка загрузки Firebase модулей...");
     
-    // Динамический импорт Firebase модулей
-    const { initializeApp, getApps } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js');
-    const { getFirestore, connectFirestoreEmulator } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
+    // Пробуем загрузить модули с обработкой CORS ошибок
+    const [appModule, firestoreModule] = await Promise.all([
+      import(urls.app).catch(err => {
+        console.warn("⚠️ Ошибка загрузки firebase-app.js:", err);
+        throw new Error(`Не удалось загрузить Firebase App модуль: ${err.message}`);
+      }),
+      import(urls.firestore).catch(err => {
+        console.warn("⚠️ Ошибка загрузки firebase-firestore.js:", err);
+        throw new Error(`Не удалось загрузить Firestore модуль: ${err.message}`);
+      })
+    ]);
     
-    // Импортируем все необходимые функции Firestore
-    const firestoreModule = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
-    window.firebaseFirestore = firestoreModule;
-    
-    console.log("✅ Firebase модули загружены");
-    console.log("Конфигурация Firebase:", {
-      projectId: firebaseConfig.projectId,
-      apiKey: firebaseConfig.apiKey ? firebaseConfig.apiKey.substring(0, 10) + '...' : 'не указан',
-      authDomain: firebaseConfig.authDomain
-    });
-    
-    // Проверяем, не инициализировано ли уже приложение
-    const existingApps = getApps();
-    if (existingApps.length > 0) {
-      console.log("⚠️ Firebase уже инициализирован, используем существующий экземпляр");
-      window.firebaseApp = existingApps[0];
-    } else {
-      console.log("🆕 Инициализация нового Firebase приложения...");
-      window.firebaseApp = initializeApp(firebaseConfig);
-      console.log("✅ Firebase приложение инициализировано:", window.firebaseApp.name);
-    }
-    
-    // Инициализируем Firestore
-    window.db = getFirestore(window.firebaseApp);
-    
-    // Проверяем, что db был создан
-    if (!window.db) {
-      console.error("❌ Firestore не был создан");
-      throw new Error("Firestore не был создан. Проверьте конфигурацию Firebase.");
-    }
-    
-    console.log("✅ Firestore создан успешно");
-    
-    // Проверка подключения к Firestore
-    try {
-      console.log("🔍 Проверка подключения к Firestore...");
-      // Проверяем, что все необходимые функции доступны
-      const requiredFunctions = ['collection', 'doc', 'getDoc', 'setDoc', 'updateDoc', 'getDocs', 
-                                  'query', 'where', 'orderBy', 'limit', 'increment', 'serverTimestamp', 
-                                  'arrayUnion', 'Timestamp'];
-      const missingFunctions = requiredFunctions.filter(fn => !firestoreModule[fn]);
-      
-      if (missingFunctions.length > 0) {
-        console.warn("⚠️ Некоторые функции Firestore недоступны:", missingFunctions);
-      } else {
-        console.log("✅ Все функции Firestore доступны");
-      }
-      
-      console.log("✅ Проверка подключения завершена успешно");
-    } catch (connectionError) {
-      console.warn("⚠️ Предупреждение при проверке подключения:", connectionError);
-      // Не прерываем инициализацию, так как это может быть просто предупреждение
-    }
-    
-    console.log("✅ Firebase инициализация завершена успешно");
-    return true;
+    console.log("✅ Firebase модули успешно загружены");
+    return { appModule, firestoreModule };
     
   } catch (error) {
-    console.error("❌ Ошибка инициализации Firebase:", error);
-    console.error("Детали ошибки:", {
-      message: error.message,
-      code: error.code,
-      name: error.name,
-      stack: error.stack
-    });
+    console.error("❌ Критическая ошибка загрузки Firebase модулей:", error);
     
-    // Дополнительная диагностика
-    if (error.message && error.message.includes('Failed to fetch')) {
-      console.error("⚠️ Проблема с загрузкой модулей Firebase. Проверьте:");
-      console.error("  1. Подключение к интернету");
-      console.error("  2. Доступность CDN Firebase");
-      console.error("  3. Блокировку скриптов браузером или расширениями");
+    // Проверяем, является ли это CORS ошибкой или проблемой сети
+    if (error.message && (
+      error.message.includes('Failed to fetch') ||
+      error.message.includes('CORS') ||
+      error.message.includes('NetworkError') ||
+      error.name === 'TypeError'
+    )) {
+      console.warn("⚠️ Обнаружена проблема с CORS или сетью. Переходим в offline режим.");
+      window.offlineMode = true;
+      throw new Error('OFFLINE_MODE');
     }
-    
-    window.db = null;
-    window.firebaseApp = null;
-    window.firebaseFirestore = null;
     
     throw error;
   }
 }
 
-// Функция проверки, запущено ли приложение в Telegram
-// Упрощенная версия: используем только проверку наличия initData, без проверки platform
-function isTelegramWebApp() {
-    // Проверяем наличие Telegram Web App API
-    if (!window.Telegram || !window.Telegram.WebApp) {
-        return false;
-    }
-    
+// Функция автоматического восстановления Firebase с повторными попытками
+async function retryFirebaseInit(maxAttempts = 3, delay = 5000) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      console.log(`🔄 Попытка инициализации Firebase ${attempt}/${maxAttempts}...`);
+      await initFirebase();
+      
+      if (window.firebaseInitialized) {
+        window.firebaseRetryCount = 0;
+        console.log("✅ Firebase успешно инициализирован");
+        return true;
+      }
+    } catch (error) {
+      console.warn(`⚠️ Попытка ${attempt} не удалась:`, error.message);
+      window.firebaseRetryCount = attempt;
+      
+      if (attempt < maxAttempts) {
+        console.log(`⏳ Повторная попытка через ${delay / 1000} секунд...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        // Увеличиваем задержку для следующей попытки (exponential backoff)
+        delay *= 1.5;
+      } else {
+        console.error("❌ Все попытки инициализации Firebase исчерпаны");
+        throw error;
+      }
+    }
+  }
+  return false;
+}
+
+// Функция инициализации Firebase (модульный подход v9+) с улучшенной обработкой ошибок
+async function initFirebase() {
+  // Если уже инициализирован, возвращаем успех
+  if (window.firebaseInitialized && window.db && window.firebaseFirestore) {
+    console.log("✅ Firebase уже инициализирован");
+    return true;
+  }
+  
+  // Если уже есть промис инициализации, ждем его
+  if (window.firebaseInitPromise) {
+    console.log("⏳ Ожидание завершения предыдущей инициализации Firebase...");
+    return await window.firebaseInitPromise;
+  }
+  
+  // Создаем промис инициализации
+  window.firebaseInitPromise = (async () => {
+    try {
+      console.log("🔧 Начало инициализации Firebase (модульный подход v9+)...");
+      
+      // Загружаем модули Firebase
+      let appModule, firestoreModule;
+      try {
+        const modules = await loadFirebaseModules();
+        appModule = modules.appModule;
+        firestoreModule = modules.firestoreModule;
+      } catch (loadError) {
+        if (loadError.message === 'OFFLINE_MODE') {
+          // Переходим в offline режим
+          window.offlineMode = true;
+          window.firebaseInitFailed = true;
+          console.warn("⚠️ Firebase недоступен, приложение работает в offline режиме");
+          return false;
+        }
+        throw loadError;
+      }
+      
+      // Импортируем необходимые функции
+      const { initializeApp, getApps } = appModule;
+      const { getFirestore } = firestoreModule;
+      
+      // Сохраняем модуль Firestore в глобальной переменной
+      window.firebaseFirestore = firestoreModule;
+      
+      console.log("✅ Firebase модули загружены");
+      console.log("Конфигурация Firebase:", {
+        projectId: firebaseConfig.projectId,
+        apiKey: firebaseConfig.apiKey ? firebaseConfig.apiKey.substring(0, 10) + '...' : 'не указан',
+        authDomain: firebaseConfig.authDomain
+      });
+      
+      // Проверяем, не инициализировано ли уже приложение
+      const existingApps = getApps();
+      if (existingApps.length > 0) {
+        console.log("⚠️ Firebase уже инициализирован, используем существующий экземпляр");
+        window.firebaseApp = existingApps[0];
+      } else {
+        console.log("🆕 Инициализация нового Firebase приложения...");
+        try {
+          window.firebaseApp = initializeApp(firebaseConfig);
+          console.log("✅ Firebase приложение инициализировано:", window.firebaseApp.name);
+        } catch (initError) {
+          console.error("❌ Ошибка инициализации Firebase приложения:", initError);
+          throw new Error(`Не удалось инициализировать Firebase: ${initError.message}`);
+        }
+      }
+      
+      // Инициализируем Firestore
+      try {
+        window.db = getFirestore(window.firebaseApp);
+      } catch (firestoreError) {
+        console.error("❌ Ошибка создания Firestore:", firestoreError);
+        throw new Error(`Не удалось создать Firestore: ${firestoreError.message}`);
+      }
+      
+      // Проверяем, что db был создан
+      if (!window.db) {
+        console.error("❌ Firestore не был создан");
+        throw new Error("Firestore не был создан. Проверьте конфигурацию Firebase.");
+      }
+      
+      console.log("✅ Firestore создан успешно");
+      
+      // Проверка подключения к Firestore
+      try {
+        console.log("🔍 Проверка подключения к Firestore...");
+        // Проверяем, что все необходимые функции доступны
+        const requiredFunctions = ['collection', 'doc', 'getDoc', 'setDoc', 'updateDoc', 'getDocs', 
+                                    'query', 'where', 'orderBy', 'limit', 'increment', 'serverTimestamp', 
+                                    'arrayUnion', 'Timestamp'];
+        const missingFunctions = requiredFunctions.filter(fn => !firestoreModule[fn]);
+        
+        if (missingFunctions.length > 0) {
+          console.warn("⚠️ Некоторые функции Firestore недоступны:", missingFunctions);
+        } else {
+          console.log("✅ Все функции Firestore доступны");
+        }
+        
+        console.log("✅ Проверка подключения завершена успешно");
+      } catch (connectionError) {
+        console.warn("⚠️ Предупреждение при проверке подключения:", connectionError);
+        // Не прерываем инициализацию, так как это может быть просто предупреждение
+      }
+      
+      window.firebaseInitialized = true;
+      window.firebaseInitFailed = false;
+      window.offlineMode = false;
+      console.log("✅ Firebase инициализация завершена успешно");
+      return true;
+      
+    } catch (error) {
+      console.error("❌ Ошибка инициализации Firebase:", error);
+      console.error("Детали ошибки:", {
+        message: error.message,
+        code: error.code,
+        name: error.name,
+        stack: error.stack
+      });
+      
+      // Дополнительная диагностика
+      if (error.message && (
+        error.message.includes('Failed to fetch') ||
+        error.message.includes('CORS') ||
+        error.message.includes('NetworkError')
+      )) {
+        console.error("⚠️ Проблема с загрузкой модулей Firebase. Проверьте:");
+        console.error("  1. Подключение к интернету");
+        console.error("  2. Доступность CDN Firebase");
+        console.error("  3. Блокировку скриптов браузером или расширениями");
+        console.error("  4. CORS политики в Telegram Web App");
+        window.offlineMode = true;
+      }
+      
+      window.db = null;
+      window.firebaseApp = null;
+      window.firebaseFirestore = null;
+      window.firebaseInitialized = false;
+      window.firebaseInitFailed = true;
+      
+      throw error;
+    } finally {
+      // Очищаем промис после завершения
+      window.firebaseInitPromise = null;
+    }
+  })();
+  
+  return await window.firebaseInitPromise;
+}
+
+// Функция проверки, запущено ли приложение в Telegram (улучшенная версия)
+function isTelegramWebApp() {
+    try {
+        // Проверяем наличие Telegram Web App API
+        if (!window.Telegram || !window.Telegram.WebApp) {
+            console.log("🔍 Telegram SDK не найден");
+            return false;
+        }
+        
         const tg = window.Telegram.WebApp;
         
-        // Проверяем наличие initData или initDataUnsafe - это основной признак Telegram Web App
-        // Работает как в мобильной, так и в десктопной версии
-        if (tg && (tg.initData || tg.initDataUnsafe)) {
+        // Множественные проверки для надежности
+        const checks = {
+            hasWebApp: !!tg,
+            hasInitData: !!(tg.initData || tg.initDataUnsafe),
+            hasVersion: !!tg.version,
+            hasPlatform: !!tg.platform,
+            hasInitDataUnsafe: !!tg.initDataUnsafe,
+            hasUser: !!(tg.initDataUnsafe && tg.initDataUnsafe.user)
+        };
+        
+        console.log("🔍 Проверка Telegram Web App:", checks);
+        
+        // Основные признаки Telegram Web App:
+        // 1. Наличие initData или initDataUnsafe (самый надежный признак)
+        // 2. Наличие version (обычно есть в Telegram)
+        // 3. Наличие platform (обычно есть в Telegram)
+        
+        if (checks.hasInitData) {
+            console.log("✅ Telegram Web App обнаружен (по initData)");
             return true;
         }
         
+        // Дополнительная проверка: если есть version и platform, вероятно это Telegram
+        if (checks.hasVersion && checks.hasPlatform) {
+            console.log("✅ Telegram Web App обнаружен (по version и platform)");
+            return true;
+        }
+        
+        // Проверка через user agent (дополнительная проверка)
+        const userAgent = navigator.userAgent || '';
+        if (userAgent.includes('Telegram') || userAgent.includes('WebApp')) {
+            console.log("✅ Telegram Web App обнаружен (по user agent)");
+            return true;
+        }
+        
+        console.log("❌ Telegram Web App не обнаружен");
         return false;
+        
     } catch (error) {
-        console.warn('Ошибка проверки Telegram WebApp:', error);
+        console.warn('⚠️ Ошибка проверки Telegram WebApp:', error);
         return false;
     }
 }
@@ -1378,6 +1854,96 @@ function getTestUserData() {
     };
 }
 
+// Функция загрузки данных пользователя в offline режиме
+async function loadUserDataOffline(userInfo) {
+    console.log("📴 Загрузка данных в offline режиме");
+    
+    try {
+        // Пытаемся загрузить данные из localStorage
+        const savedDataKey = `userData_${userInfo.userId}`;
+        const savedData = localStorage.getItem(savedDataKey);
+        
+        if (savedData) {
+            try {
+                window.userData = JSON.parse(savedData);
+                console.log("✅ Данные загружены из localStorage");
+                
+                // Восстанавливаем энергию на основе времени
+                await updateEnergy();
+                
+                updateUI();
+                renderShop();
+                updateReferralsUI();
+                
+                hideLoading();
+                showContent();
+                
+                const preloader = document.getElementById('preloader');
+                if (preloader) preloader.style.display = 'none';
+                
+                // Показываем предупреждение об offline режиме
+                showError('⚠️ Работа в offline режиме. Данные загружены из кэша. Некоторые функции могут быть недоступны.');
+                
+                return;
+            } catch (parseError) {
+                console.error("Ошибка парсинга сохраненных данных:", parseError);
+            }
+        }
+        
+        // Если нет сохраненных данных, создаем новые
+        console.log("🆕 Создание новых данных в offline режиме");
+        window.userData = {
+            userId: userInfo.userId,
+            firstName: userInfo.firstName,
+            username: userInfo.username,
+            photoUrl: userInfo.photoUrl || '',
+            balance: 0,
+            totalClicks: 0,
+            perClickValue: 1,
+            passiveIncome: 0,
+            upgrades: {},
+            referrals: [],
+            referralsEarned: 0,
+            invitedBy: null,
+            energy: 1000,
+            maxEnergy: 1000,
+            energyPerHour: 100,
+            totalEarned: 0,
+            weeklyEarned: 0,
+            leaderboardVisible: true,
+            lastEnergyUpdate: new Date().toISOString(),
+            lastWeeklyReset: new Date().toISOString(),
+            createdAt: new Date().toISOString(),
+            lastActive: new Date().toISOString()
+        };
+        
+        // Сохраняем в localStorage
+        try {
+            localStorage.setItem(savedDataKey, JSON.stringify(window.userData));
+        } catch (storageError) {
+            console.warn("Не удалось сохранить данные в localStorage:", storageError);
+        }
+        
+        recalculateStats();
+        updateUI();
+        renderShop();
+        updateReferralsUI();
+        
+        hideLoading();
+        showContent();
+        
+        const preloader = document.getElementById('preloader');
+        if (preloader) preloader.style.display = 'none';
+        
+        showError('⚠️ Работа в offline режиме. Данные не будут синхронизироваться с сервером.');
+        
+    } catch (error) {
+        console.error("Ошибка загрузки данных в offline режиме:", error);
+        showError('Ошибка загрузки данных в offline режиме. Попробуйте перезагрузить страницу.');
+        hideLoading();
+    }
+}
+
 // Функция загрузки данных пользователя
 async function loadUserData() {
     console.log("Loading user data...");
@@ -1385,22 +1951,51 @@ async function loadUserData() {
     showLoading();
     hideError();
     
-    // Инициализируем Firebase если еще не инициализирован
-    if (!window.db) {
+    // Инициализируем Firebase если еще не инициализирован (с ожиданием)
+    if (!window.firebaseInitialized && !window.firebaseInitPromise) {
         try {
-            initFirebase();
+            console.log("⏳ Ожидание инициализации Firebase...");
+            await initFirebase();
         } catch (error) {
             console.error("Ошибка инициализации Firebase в loadUserData:", error);
-            showError(`Ошибка инициализации Firebase: ${error.message || error}`);
-            hideLoading();
-            return;
+            
+            // Если это offline режим, продолжаем работу с локальными данными
+            if (window.offlineMode) {
+                console.warn("⚠️ Работа в offline режиме - используем локальные данные");
+                // Продолжаем работу без Firebase
+            } else {
+                showError(`Ошибка инициализации Firebase: ${error.message || error}`);
+                hideLoading();
+                return;
+            }
+        }
+    } else if (window.firebaseInitPromise) {
+        // Ждем завершения инициализации
+        console.log("⏳ Ожидание завершения инициализации Firebase...");
+        try {
+            await window.firebaseInitPromise;
+        } catch (error) {
+            console.error("Ошибка при ожидании инициализации Firebase:", error);
+            if (!window.offlineMode) {
+                showError(`Ошибка инициализации Firebase: ${error.message || error}`);
+                hideLoading();
+                return;
+            }
         }
     }
     
-    if (!window.db) {
+    // Проверяем, доступен ли Firestore (если не в offline режиме)
+    if (!window.offlineMode && !window.db) {
         console.error("Firestore not initialized!");
         showError('Ошибка: Firestore не был инициализирован. Проверьте конфигурацию Firebase.');
         hideLoading();
+        return;
+    }
+    
+    // Если в offline режиме, используем локальные данные
+    if (window.offlineMode) {
+        console.log("📴 Работа в offline режиме - загрузка локальных данных");
+        await loadUserDataOffline(userInfo);
         return;
     }
     
@@ -1898,31 +2493,13 @@ async function handleClick() {
     });
     
     try {
-        if (!window.db) {
-            throw new Error('Firebase не инициализирован');
-        }
         if (!window.userData) {
             throw new Error('Данные пользователя не загружены');
         }
         
-        const userId = window.userData.userId.toString();
-        const userRef = getDocRef('users', userId);
-        
         // Тратим энергию
         window.userData.energy = Math.max(0, (window.userData.energy || 0) - 1);
         window.userData.energy = Math.floor(window.userData.energy); // Округляем до целых
-        
-        // Атомарное увеличение balance и totalClicks, уменьшение энергии
-        if (!window.firebaseFirestore) {
-            throw new Error('Firebase Firestore модуль не загружен');
-        }
-        
-        await window.firebaseFirestore.updateDoc(userRef, {
-            balance: window.firebaseFirestore.increment(perClickValue),
-            totalClicks: window.firebaseFirestore.increment(1),
-            energy: window.firebaseFirestore.increment(-1),
-            lastActive: window.firebaseFirestore.serverTimestamp()
-        });
         
         // Обновляем локальные данные
         window.userData.balance = (window.userData.balance || 0) + perClickValue;
@@ -1931,35 +2508,58 @@ async function handleClick() {
         // Обновляем статистику заработанного
         await updateEarnedStats(perClickValue);
         
+        // Сохраняем в Firebase (если не в offline режиме)
+        if (!window.offlineMode && window.db && window.firebaseFirestore) {
+            try {
+                const userId = window.userData.userId.toString();
+                const userRef = getDocRef('users', userId);
+                
+                await window.firebaseFirestore.updateDoc(userRef, {
+                    balance: window.firebaseFirestore.increment(perClickValue),
+                    totalClicks: window.firebaseFirestore.increment(1),
+                    energy: window.firebaseFirestore.increment(-1),
+                    lastActive: window.firebaseFirestore.serverTimestamp()
+                });
+                console.log("✅ Данные сохранены в Firebase");
+            } catch (firebaseError) {
+                console.warn("⚠️ Ошибка сохранения в Firebase, сохраняем локально:", firebaseError);
+                // Сохраняем в localStorage в случае ошибки
+                saveUserDataToLocalStorage();
+            }
+        } else {
+            // В offline режиме сохраняем только в localStorage
+            saveUserDataToLocalStorage();
+        }
+        
         console.log("handleClick: После клика:", { 
             balance: window.userData.balance, 
             totalClicks: window.userData.totalClicks,
             energy: window.userData.energy,
-            increment: perClickValue
+            increment: perClickValue,
+            offlineMode: window.offlineMode
         });
         
         // Обновляем UI
         updateUI();
         
-        // Вибрация при клике (только в Telegram, не в режиме разработки)
+        // Улучшенная вибрация и звук при клике (только в Telegram, не в режиме разработки)
         if (!window.isDevMode) {
-            safeTelegramCall((tg) => {
-                if (tg.HapticFeedback) {
-                    try {
-                        tg.HapticFeedback.impactOccurred('light');
-                    } catch (error) {
-                        console.warn('Ошибка вибрации:', error);
-                    }
-                }
-                return true;
-            });
+            // Легкая вибрация при клике
+            if (window.telegramHaptic) {
+                window.telegramHaptic.impact('light');
+            }
+            
+            // Звук клика
+            if (window.telegramSound) {
+                window.telegramSound.play('click');
+            }
         }
         
         console.log(`handleClick: Клик выполнен! Баланс: ${window.userData.balance}, Кликов: ${window.userData.totalClicks}, Энергия: ${window.userData.energy}`);
         
     } catch (error) {
         console.error('handleClick: Ошибка при обработке клика:', error);
-        showError('Ошибка при сохранении данных. Попробуйте еще раз.');
+        showError('Ошибка при обработке клика. Попробуйте еще раз.');
     }
 }
 
@@ -2000,30 +2600,201 @@ function hideDevModeIndicator() {
     }
 }
 
+// Функция настройки Telegram Web App с улучшенной обработкой API
+function setupTelegramWebApp(tg) {
+    try {
+        // Вызываем ready() - это обязательный метод для инициализации
+        tg.ready();
+        
+        // Разворачиваем приложение на весь экран
+        tg.expand();
+        
+        // Функция применения темы
+        const applyTheme = (colorScheme, backgroundColor, textColor, hintColor, linkColor, buttonColor, buttonTextColor) => {
+            document.documentElement.setAttribute('data-theme', colorScheme || 'light');
+            
+            // Применяем цвета Telegram
+            if (backgroundColor) {
+                document.body.style.backgroundColor = backgroundColor;
+                document.documentElement.style.setProperty('--tg-theme-bg-color', backgroundColor);
+            }
+            if (textColor) {
+                document.documentElement.style.setProperty('--tg-theme-text-color', textColor);
+            }
+            if (hintColor) {
+                document.documentElement.style.setProperty('--tg-theme-hint-color', hintColor);
+            }
+            if (linkColor) {
+                document.documentElement.style.setProperty('--tg-theme-link-color', linkColor);
+            }
+            if (buttonColor) {
+                document.documentElement.style.setProperty('--tg-theme-button-color', buttonColor);
+            }
+            if (buttonTextColor) {
+                document.documentElement.style.setProperty('--tg-theme-button-text-color', buttonTextColor);
+            }
+            
+            // Добавляем класс для темной темы
+            if (colorScheme === 'dark') {
+                document.documentElement.classList.add('dark-theme');
+                document.body.classList.add('dark-theme');
+            } else {
+                document.documentElement.classList.remove('dark-theme');
+                document.body.classList.remove('dark-theme');
+            }
+            
+            console.log('✅ Тема применена:', colorScheme);
+        };
+        
+        // Применяем начальную тему
+        applyTheme(
+            tg.colorScheme,
+            tg.backgroundColor,
+            tg.textColor,
+            tg.hintColor,
+            tg.linkColor,
+            tg.buttonColor,
+            tg.buttonTextColor
+        );
+        
+        // Обработчик изменения темы с полной поддержкой всех цветов
+        try {
+            tg.onEvent('themeChanged', () => {
+                console.log('🎨 Тема изменена');
+                applyTheme(
+                    tg.colorScheme,
+                    tg.backgroundColor,
+                    tg.textColor,
+                    tg.hintColor,
+                    tg.linkColor,
+                    tg.buttonColor,
+                    tg.buttonTextColor
+                );
+            });
+        } catch (e) {
+            console.warn('⚠️ Ошибка установки обработчика themeChanged:', e);
+        }
+        
+        // Обработчик изменения размера viewport с адаптивным дизайном
+        try {
+            const handleViewportChange = () => {
+                const viewportHeight = tg.viewportHeight || window.innerHeight;
+                const viewportStableHeight = tg.viewportStableHeight || viewportHeight;
+                
+                console.log('📐 Viewport изменен:', {
+                    height: viewportHeight,
+                    stableHeight: viewportStableHeight,
+                    isExpanded: tg.isExpanded
+                });
+                
+                // Применяем адаптивные стили
+                document.documentElement.style.setProperty('--viewport-height', `${viewportHeight}px`);
+                document.documentElement.style.setProperty('--viewport-stable-height', `${viewportStableHeight}px`);
+                
+                // Обновляем контейнер приложения
+                const app = document.getElementById('app');
+                if (app) {
+                    app.style.minHeight = `${viewportStableHeight}px`;
+                }
+            };
+            
+            tg.onEvent('viewportChanged', handleViewportChange);
+            
+            // Вызываем сразу для установки начальных значений
+            handleViewportChange();
+        } catch (e) {
+            console.warn('⚠️ Ошибка установки обработчика viewportChanged:', e);
+        }
+        
+        // Функция вибрации с разными типами
+        window.telegramHaptic = {
+            impact: (style = 'medium') => {
+                if (tg.HapticFeedback) {
+                    try {
+                        tg.HapticFeedback.impactOccurred(style); // 'light', 'medium', 'heavy', 'rigid', 'soft'
+                    } catch (e) {
+                        console.warn('Ошибка вибрации impact:', e);
+                    }
+                }
+            },
+            notification: (type = 'success') => {
+                if (tg.HapticFeedback) {
+                    try {
+                        tg.HapticFeedback.notificationOccurred(type); // 'error', 'success', 'warning'
+                    } catch (e) {
+                        console.warn('Ошибка вибрации notification:', e);
+                    }
+                }
+            },
+            selection: () => {
+                if (tg.HapticFeedback) {
+                    try {
+                        tg.HapticFeedback.selectionChanged();
+                    } catch (e) {
+                        console.warn('Ошибка вибрации selection:', e);
+                    }
+                }
+            }
+        };
+        
+        // Функция звуков обратной связи
+        window.telegramSound = {
+            play: (soundType = 'click') => {
+                // Telegram Web App не имеет встроенного API для звуков,
+                // но можно использовать Web Audio API для простых звуков
+                try {
+                    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                    const oscillator = audioContext.createOscillator();
+                    const gainNode = audioContext.createGain();
+                    
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+                    
+                    // Разные частоты для разных типов звуков
+                    const frequencies = {
+                        click: 800,
+                        success: 1000,
+                        error: 400,
+                        coin: 600
+                    };
+                    
+                    oscillator.frequency.value = frequencies[soundType] || 800;
+                    oscillator.type = 'sine';
+                    gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
+                    
+                    oscillator.start(audioContext.currentTime);
+                    oscillator.stop(audioContext.currentTime + 0.1);
+                } catch (e) {
+                    console.warn('Ошибка воспроизведения звука:', e);
+                }
+            }
+        };
+        
+        console.log('✅ Telegram WebApp инициализирован с улучшениями');
+        console.log('📊 Информация о WebApp:', {
+            platform: tg.platform || 'не указана',
+            version: tg.version || 'не указана',
+            colorScheme: tg.colorScheme || 'не указана',
+            viewportHeight: tg.viewportHeight || 'не указана',
+            viewportStableHeight: tg.viewportStableHeight || 'не указана',
+            isExpanded: tg.isExpanded,
+            initData: !!tg.initData,
+            initDataUnsafe: !!tg.initDataUnsafe,
+            hapticFeedback: !!tg.HapticFeedback
+        });
+        
+    } catch (error) {
+        console.error('❌ Ошибка настройки Telegram Web App:', error);
+    }
+}
+
 // Функция инициализации приложения
 async function initApp() {
     try {
-        // 1. Инициализация Firebase (модульный подход v9+)
-        try {
-            await initFirebase();
-            if (!window.db || !window.firebaseFirestore) {
-                console.error("❌ Firestore не был инициализирован");
-                showError('Ошибка инициализации Firebase. Проверьте конфигурацию и подключение к интернету.');
-                return;
-            }
-            console.log("✅ Firebase initialized successfully");
-            console.log("✅ Firestore модуль загружен:", Object.keys(window.firebaseFirestore));
-        } catch (error) {
-            console.error("❌ Firebase error:", error);
-            console.error("Детали ошибки:", {
-                message: error.message,
-                code: error.code,
-                name: error.name,
-                stack: error.stack
-            });
-            showError(`Ошибка инициализации Firebase: ${error.message || 'Проверьте конфигурацию и подключение к интернету.'}`);
-            return;
-        }
+        // 1. Проверка Telegram Web App (должна быть первой)
+        const isTelegram = isTelegramWebApp();
+        console.log("🔍 Проверка Telegram Web App:", isTelegram ? "✅ Обнаружен" : "❌ Не обнаружен");
         
         // 2. Ожидание загрузки Telegram SDK (для десктопной версии может потребоваться время)
         await waitForTelegram(5000);
@@ -2032,71 +2803,61 @@ async function initApp() {
         // Важно: инициализация должна происходить ДО загрузки данных пользователя
         const tg = getTelegramWebApp();
         if (tg) {
-            safeTelegramCall((t) => {
-                // Вызываем ready() - это обязательный метод для инициализации
-                t.ready();
-                
-                // Разворачиваем приложение на весь экран
-                t.expand();
-                
-                // Настраиваем тему Telegram
-                if (t.colorScheme) {
-                    document.documentElement.setAttribute('data-theme', t.colorScheme);
-                    // Также можно установить цвет фона
-                    if (t.backgroundColor) {
-                        document.body.style.backgroundColor = t.backgroundColor;
-                    }
-                }
-                
-                // Обработчик изменения темы
-                try {
-                    t.onEvent('themeChanged', () => {
-                        if (t.colorScheme) {
-                            document.documentElement.setAttribute('data-theme', t.colorScheme);
-                        }
-                        if (t.backgroundColor) {
-                            document.body.style.backgroundColor = t.backgroundColor;
-                        }
-                    });
-                } catch (e) {
-                    console.warn('Ошибка установки обработчика themeChanged:', e);
-                }
-                
-                // Обработчик изменения размера окна
-                try {
-                    t.onEvent('viewportChanged', () => {
-                        // Можно обработать изменение размера окна
-                        console.log('Viewport changed:', t.viewportHeight);
-                    });
-                } catch (e) {
-                    console.warn('Ошибка установки обработчика viewportChanged:', e);
-                }
-                
-                // Включаем вибрацию при клике (если поддерживается)
-                if (t.HapticFeedback) {
-                    // Будет использоваться в handleClick
-                }
-                
-                console.log('✅ Telegram WebApp инициализирован');
-                console.log('Платформа:', t.platform || 'не указана');
-                console.log('Версия:', t.version || 'не указана');
-                console.log('Цветовая схема:', t.colorScheme || 'не указана');
-                console.log('Высота viewport:', t.viewportHeight || 'не указана');
-                console.log('InitData доступен:', !!t.initData);
-                console.log('InitDataUnsafe доступен:', !!t.initDataUnsafe);
-                return true;
-            });
+            setupTelegramWebApp(tg);
         } else {
             console.log('⚠️ Telegram WebApp не обнаружен - режим разработки');
         }
         
-        // 4. Режим работы определится в loadUserData()
+        // 4. Инициализация Firebase (модульный подход v9+) с автоматическим восстановлением
+        // Пытаемся инициализировать Firebase, но не прерываем выполнение в offline режиме
+        let firebaseInitialized = false;
+        try {
+            await retryFirebaseInit(window.maxRetryAttempts, window.retryDelay);
+            if (window.offlineMode) {
+                console.log("⚠️ Firebase недоступен, работаем в offline режиме");
+            } else if (!window.db || !window.firebaseFirestore) {
+                console.error("❌ Firestore не был инициализирован");
+                // Не прерываем выполнение, продолжаем в offline режиме
+                window.offlineMode = true;
+            } else {
+                firebaseInitialized = true;
+                console.log("✅ Firebase initialized successfully");
+                console.log("✅ Firestore модуль загружен:", Object.keys(window.firebaseFirestore));
+            }
+        } catch (error) {
+            console.error("❌ Firebase error:", error);
+            console.error("Детали ошибки:", {
+                message: error.message,
+                code: error.code,
+                name: error.name,
+                stack: error.stack
+            });
+            
+            // Если это не критическая ошибка или мы в offline режиме, продолжаем
+            if (error.message === 'OFFLINE_MODE' || window.offlineMode) {
+                console.log("⚠️ Продолжаем работу в offline режиме");
+                window.offlineMode = true;
+            } else {
+                // Показываем предупреждение, но не прерываем выполнение
+                console.warn("⚠️ Firebase недоступен, переходим в offline режим");
+                window.offlineMode = true;
+            }
+        }
         
-        // 5. Загрузка данных пользователя (после инициализации Firebase)
+        // 4.5. Настройка мониторинга сети и синхронизации
+        setupNetworkMonitoring();
+        
+        // 5. Загрузка данных пользователя (работает как с Firebase, так и в offline режиме)
         await loadUserData();
         
-        // 6. Проверка индексов Firestore (после загрузки данных пользователя)
-        await checkAndCreateIndexes();
+        // 6. Проверка индексов Firestore (только если Firebase инициализирован)
+        if (firebaseInitialized && !window.offlineMode) {
+            try {
+                await checkAndCreateIndexes();
+            } catch (indexError) {
+                console.warn("⚠️ Ошибка проверки индексов:", indexError);
+            }
+        }
         
         // 7. Инициализация навигации (ДО запуска пассивного дохода)
         initNavigation();
@@ -2138,6 +2899,138 @@ if (document.readyState === 'loading') {
 } else {
     // DOM уже загружен
     initApp();
+}
+
+// Служебные функции для отладки в продакшене
+window.debugUtils = {
+  // Получить информацию о состоянии приложения
+  getAppState: () => {
+    return {
+      userData: window.userData ? {
+        userId: window.userData.userId,
+        balance: window.userData.balance,
+        totalClicks: window.userData.totalClicks,
+        energy: window.userData.energy,
+        maxEnergy: window.userData.maxEnergy
+      } : null,
+      firebase: {
+        initialized: window.firebaseInitialized,
+        offlineMode: window.offlineMode,
+        connectionStatus: window.connectionStatus,
+        retryCount: window.firebaseRetryCount
+      },
+      cache: {
+        shop: !!window.cache.shop,
+        leaderboard: {
+          global: !!window.cache.leaderboard.global,
+          friends: !!window.cache.leaderboard.friends,
+          weekly: !!window.cache.leaderboard.weekly
+        }
+      },
+      telegram: {
+        isWebApp: isTelegramWebApp(),
+        platform: window.Telegram?.WebApp?.platform,
+        version: window.Telegram?.WebApp?.version,
+        colorScheme: window.Telegram?.WebApp?.colorScheme
+      },
+      performance: {
+        lastSyncTime: window.lastSyncTime,
+        syncInProgress: window.syncInProgress
+      }
+    };
+  },
+  
+  // Очистить кэш
+  clearCache: () => {
+    window.cache = {
+      shop: null,
+      leaderboard: {
+        global: null,
+        friends: null,
+        weekly: null
+      },
+      lastUpdate: {}
+    };
+    console.log("🗑️ Кэш очищен");
+  },
+  
+  // Принудительная синхронизация
+  forceSync: async () => {
+    if (window.offlineMode) {
+      console.warn("⚠️ Невозможно синхронизировать в offline режиме");
+      return false;
+    }
+    try {
+      await syncDataFromLocalStorage();
+      console.log("✅ Принудительная синхронизация завершена");
+      return true;
+    } catch (error) {
+      console.error("❌ Ошибка принудительной синхронизации:", error);
+      return false;
+    }
+  },
+  
+  // Переинициализация Firebase
+  reinitFirebase: async () => {
+    try {
+      window.firebaseInitialized = false;
+      window.offlineMode = false;
+      await retryFirebaseInit();
+      console.log("✅ Firebase переинициализирован");
+      return true;
+    } catch (error) {
+      console.error("❌ Ошибка переинициализации Firebase:", error);
+      return false;
+    }
+  },
+  
+  // Экспорт данных для отладки
+  exportData: () => {
+    const data = {
+      userData: window.userData,
+      cache: window.cache,
+      state: window.debugUtils.getAppState(),
+      timestamp: new Date().toISOString()
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `debug-data-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    console.log("📥 Данные экспортированы");
+  },
+  
+  // Логирование производительности
+  logPerformance: () => {
+    if (window.performance && window.performance.timing) {
+      const timing = window.performance.timing;
+      const perf = {
+        pageLoad: timing.loadEventEnd - timing.navigationStart,
+        domReady: timing.domContentLoadedEventEnd - timing.navigationStart,
+        firstPaint: timing.responseEnd - timing.requestStart,
+        dns: timing.domainLookupEnd - timing.domainLookupStart,
+        tcp: timing.connectEnd - timing.connectStart
+      };
+      console.log("⚡ Производительность:", perf);
+      return perf;
+    }
+    return null;
+  }
+};
+
+// Добавляем глобальные команды для консоли (только в dev режиме или с флагом)
+if (window.isDevMode || localStorage.getItem('enableDebugUtils') === 'true') {
+  window.DEBUG = window.debugUtils;
+  console.log("🔧 Служебные функции отладки доступны через window.DEBUG");
+  console.log("Доступные команды:");
+  console.log("  DEBUG.getAppState() - получить состояние приложения");
+  console.log("  DEBUG.clearCache() - очистить кэш");
+  console.log("  DEBUG.forceSync() - принудительная синхронизация");
+  console.log("  DEBUG.reinitFirebase() - переинициализация Firebase");
+  console.log("  DEBUG.exportData() - экспорт данных для отладки");
+  console.log("  DEBUG.logPerformance() - логирование производительности");
 }
 
 // В КОНЦЕ файла добавь:

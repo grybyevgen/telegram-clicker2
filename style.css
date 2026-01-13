@@ -611,3 +611,78 @@ h1 {
     color: var(--tg-theme-hint-color, #999999);
     font-size: 14px;
 }
+
+/* Темная тема */
+.dark-theme {
+    background: var(--tg-theme-bg-color, #1a1a1a) !important;
+    color: var(--tg-theme-text-color, #ffffff) !important;
+}
+
+.dark-theme .upgrade-card {
+    background: var(--tg-theme-secondary-bg-color, #2a2a2a);
+    border-color: var(--tg-theme-hint-color, #555555);
+}
+
+.dark-theme .stat-card {
+    background: var(--tg-theme-secondary-bg-color, #2a2a2a);
+}
+
+.dark-theme .leaderboard-item {
+    background: var(--tg-theme-secondary-bg-color, #2a2a2a);
+    border-color: var(--tg-theme-hint-color, #555555);
+}
+
+.dark-theme .referral-link-input {
+    background: var(--tg-theme-secondary-bg-color, #2a2a2a);
+    color: var(--tg-theme-text-color, #ffffff);
+    border-color: var(--tg-theme-hint-color, #555555);
+}
+
+/* Уведомление о статусе соединения */
+#connection-status {
+    animation: slideDown 0.3s ease;
+}
+
+@keyframes slideDown {
+    from {
+        transform: translateY(-100%);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+/* Адаптивные стили для viewport */
+:root {
+    --viewport-height: 100vh;
+    --viewport-stable-height: 100vh;
+}
+
+#app {
+    min-height: var(--viewport-stable-height, 100vh);
+}
+
+/* Улучшения производительности */
+.upgrade-card,
+.leaderboard-item,
+.stat-card {
+    will-change: transform;
+    transform: translateZ(0);
+}
+
+/* Анимации для обратной связи */
+@keyframes pulse {
+    0%, 100% {
+        transform: scale(1);
+    }
+    50% {
+        transform: scale(1.05);
+    }
+}
+
+.buy-btn:active,
+.click-button:active {
+    animation: pulse 0.2s ease;
+}
