@@ -7,16 +7,15 @@
   function checkDependencies() {
     const statusEl = document.getElementById('load-status');
     
-    if (typeof firebase === 'undefined') {
-      if (statusEl) statusEl.innerHTML = '<span style="color:red">❌ Firebase не загружен</span><br>Обновите с Ctrl+F5';
-      return false;
-    }
+    // Проверяем, что Firebase модули доступны (они загружаются динамически)
+    // В модульном подходе v9+ мы используем динамические импорты, поэтому проверка будет в initFirebase
+    // Здесь просто проверяем, что скрипты загружены
     
     if (typeof Telegram === 'undefined') {
       console.log("Telegram SDK не найден (нормально в браузере)");
     }
     
-    if (statusEl) statusEl.textContent = "✅ Все зависимости загружены";
+    if (statusEl) statusEl.textContent = "✅ Зависимости проверяются...";
     return true;
   }
   
@@ -156,13 +155,21 @@ function renderShop() {
 }
 
 // ФУНКЦИЯ: Обновление энергии по времени
-function updateEnergy() {
+async function updateEnergy() {
   if (!window.userData || !window.userData.lastEnergyUpdate) return;
   
   const now = new Date();
-  const lastUpdate = window.userData.lastEnergyUpdate.toDate 
-    ? window.userData.lastEnergyUpdate.toDate() 
-    : new Date(window.userData.lastEnergyUpdate);
+  let lastUpdate;
+  
+  // Обрабатываем Timestamp из модульного API
+  if (window.userData.lastEnergyUpdate && typeof window.userData.lastEnergyUpdate.toDate === 'function') {
+    lastUpdate = window.userData.lastEnergyUpdate.toDate();
+  } else if (window.userData.lastEnergyUpdate && window.userData.lastEnergyUpdate.seconds) {
+    // Если это Timestamp объект с seconds
+    lastUpdate = new Date(window.userData.lastEnergyUpdate.seconds * 1000);
+  } else {
+    lastUpdate = new Date(window.userData.lastEnergyUpdate);
+  }
   
   const hoursPassed = (now - lastUpdate) / (1000 * 60 * 60);
   
@@ -177,18 +184,21 @@ function updateEnergy() {
     window.userData.energy = Math.floor(window.userData.energy);
     
     // Обновляем в Firestore только если энергия изменилась
-    if (window.userData.energy !== oldEnergy && window.db) {
-      window.db.collection('users').doc(window.userData.userId).update({
-        energy: window.userData.energy,
-        lastEnergyUpdate: firebase.firestore.FieldValue.serverTimestamp()
-      }).then(() => {
+    if (window.userData.energy !== oldEnergy && window.db && window.firebaseFirestore) {
+      try {
+        const userRef = getDocRef('users', window.userData.userId);
+        await window.firebaseFirestore.updateDoc(userRef, {
+          energy: window.userData.energy,
+          lastEnergyUpdate: window.firebaseFirestore.serverTimestamp()
+        });
+        
         // Обновляем lastEnergyUpdate в локальных данных
-        window.userData.lastEnergyUpdate = firebase.firestore.FieldValue.serverTimestamp();
+        window.userData.lastEnergyUpdate = window.firebaseFirestore.serverTimestamp();
         updateEnergyUI();
         console.log(`updateEnergy: Энергия обновлена: ${oldEnergy} -> ${window.userData.energy}`);
-      }).catch(err => {
+      } catch (err) {
         console.error('Ошибка обновления энергии:', err);
-      });
+      }
     } else if (window.userData.energy !== oldEnergy) {
       // Обновляем UI даже если нет подключения к БД
       updateEnergyUI();
@@ -197,20 +207,25 @@ function updateEnergy() {
 }
 
 // ФУНКЦИЯ: Пассивный доход
-function applyPassiveIncome() {
-  if (!window.userData || !window.db) return;
+async function applyPassiveIncome() {
+  if (!window.userData || !window.db || !window.firebaseFirestore) return;
   
   const passiveIncome = window.userData.passiveIncome || 0;
   if (passiveIncome > 0) {
-    const newBalance = window.userData.balance + passiveIncome;
-    window.userData.balance = newBalance;
-    
-    window.db.collection("users").doc(window.userData.userId).update({
-      balance: firebase.firestore.FieldValue.increment(passiveIncome),
-      lastActive: firebase.firestore.FieldValue.serverTimestamp()
-    });
-    
-    updateUI();
+    try {
+      const newBalance = window.userData.balance + passiveIncome;
+      window.userData.balance = newBalance;
+      
+      const userRef = getDocRef("users", window.userData.userId);
+      await window.firebaseFirestore.updateDoc(userRef, {
+        balance: window.firebaseFirestore.increment(passiveIncome),
+        lastActive: window.firebaseFirestore.serverTimestamp()
+      });
+      
+      updateUI();
+    } catch (error) {
+      console.error('Ошибка применения пассивного дохода:', error);
+    }
   }
 }
 
@@ -282,16 +297,27 @@ async function buyUpgrade(upgradeId) {
   }
   
   // Сохраняем в Firestore
-  await window.db.collection("users").doc(window.userData.userId).update({
-    balance: window.userData.balance,
-    perClickValue: window.userData.perClickValue,
-    passiveIncome: window.userData.passiveIncome,
-    upgrades: window.userData.upgrades,
-    energy: window.userData.energy,
-    maxEnergy: window.userData.maxEnergy,
-    energyPerHour: window.userData.energyPerHour,
-    lastActive: firebase.firestore.FieldValue.serverTimestamp()
-  });
+  if (!window.firebaseFirestore) {
+    console.error("buyUpgrade: Firebase Firestore модуль не загружен");
+    return;
+  }
+  
+  try {
+    const userRef = getDocRef("users", window.userData.userId);
+    await window.firebaseFirestore.updateDoc(userRef, {
+      balance: window.userData.balance,
+      perClickValue: window.userData.perClickValue,
+      passiveIncome: window.userData.passiveIncome,
+      upgrades: window.userData.upgrades,
+      energy: window.userData.energy,
+      maxEnergy: window.userData.maxEnergy,
+      energyPerHour: window.userData.energyPerHour,
+      lastActive: window.firebaseFirestore.serverTimestamp()
+    });
+  } catch (error) {
+    console.error('buyUpgrade: Ошибка сохранения в Firestore:', error);
+    throw error;
+  }
   
   console.log(`buyUpgrade: Куплено ${upgrade.name}, уровень: ${level + 1}, новые значения:`, {
     perClickValue: window.userData.perClickValue,
@@ -520,29 +546,36 @@ async function processReferralParam() {
   console.log(`Обработка реферальной ссылки от: ${refId}`);
   
   try {
+    if (!window.firebaseFirestore) {
+      console.error('processReferralParam: Firebase Firestore модуль не загружен');
+      return;
+    }
+    
     // Проверяем, существует ли приглашающий пользователь
-    const inviterDoc = await window.db.collection('users').doc(refId).get();
-    if (!inviterDoc.exists) {
+    const inviterRef = getDocRef('users', refId);
+    const inviterDoc = await window.firebaseFirestore.getDoc(inviterRef);
+    if (!inviterDoc.exists()) {
       console.log('Приглашающий пользователь не найден в базе данных');
       return;
     }
     
     // 1. Записываем кто пригласил
-    await window.db.collection('users').doc(window.userData.userId).update({
+    const userRef = getDocRef('users', window.userData.userId);
+    await window.firebaseFirestore.updateDoc(userRef, {
       invitedBy: refId
     });
     
     window.userData.invitedBy = refId;
     
     // 2. Добавляем реферала к приглашающему
-    await window.db.collection('users').doc(refId).update({
-      referrals: firebase.firestore.FieldValue.arrayUnion(window.userData.userId)
+    await window.firebaseFirestore.updateDoc(inviterRef, {
+      referrals: window.firebaseFirestore.arrayUnion(window.userData.userId)
     });
     
     // 3. Начисляем бонус приглашающему (10 монет)
-    await window.db.collection('users').doc(refId).update({
-      balance: firebase.firestore.FieldValue.increment(10),
-      referralsEarned: firebase.firestore.FieldValue.increment(10)
+    await window.firebaseFirestore.updateDoc(inviterRef, {
+      balance: window.firebaseFirestore.increment(10),
+      referralsEarned: window.firebaseFirestore.increment(10)
     });
     
     console.log('✅ Реферал успешно зарегистрирован! Бонус 10 монет начислен приглашающему.');
@@ -566,7 +599,7 @@ window.indexesStatus = {
 
 // Проверка индексов Firestore
 async function checkAndCreateIndexes() {
-  if (!window.db) {
+  if (!window.db || !window.firebaseFirestore) {
     console.warn('Firestore не инициализирован, пропускаем проверку индексов');
     return;
   }
@@ -576,11 +609,14 @@ async function checkAndCreateIndexes() {
     
     // Проверяем индекс для глобального лидерборда
     try {
-      const testQueryGlobal = await window.db.collection('users')
-        .where('leaderboardVisible', '==', true)
-        .orderBy('totalEarned', 'desc')
-        .limit(1)
-        .get();
+      const usersCollection = getCollection('users');
+      const testQueryGlobal = window.firebaseFirestore.query(
+        usersCollection,
+        window.firebaseFirestore.where('leaderboardVisible', '==', true),
+        window.firebaseFirestore.orderBy('totalEarned', 'desc'),
+        window.firebaseFirestore.limit(1)
+      );
+      await window.firebaseFirestore.getDocs(testQueryGlobal);
       
       window.indexesStatus.globalIndexExists = true;
       console.log('✅ Индекс для глобального лидерборда существует');
@@ -595,11 +631,14 @@ async function checkAndCreateIndexes() {
     
     // Проверяем индекс для недельного лидерборда
     try {
-      const testQueryWeekly = await window.db.collection('users')
-        .where('leaderboardVisible', '==', true)
-        .orderBy('weeklyEarned', 'desc')
-        .limit(1)
-        .get();
+      const usersCollection = getCollection('users');
+      const testQueryWeekly = window.firebaseFirestore.query(
+        usersCollection,
+        window.firebaseFirestore.where('leaderboardVisible', '==', true),
+        window.firebaseFirestore.orderBy('weeklyEarned', 'desc'),
+        window.firebaseFirestore.limit(1)
+      );
+      await window.firebaseFirestore.getDocs(testQueryWeekly);
       
       window.indexesStatus.weeklyIndexExists = true;
       console.log('✅ Индекс для недельного лидерборда существует');
@@ -620,39 +659,55 @@ async function checkAndCreateIndexes() {
 }
 
 // Обновление earned полей при кликах/покупках
-function updateEarnedStats(amount) {
+async function updateEarnedStats(amount) {
   if (!window.userData) return;
   
   window.userData.totalEarned = (window.userData.totalEarned || 0) + amount;
   window.userData.weeklyEarned = (window.userData.weeklyEarned || 0) + amount;
   
   // Сохраняем в Firestore
-  if (window.db) {
-    window.db.collection('users').doc(window.userData.userId).update({
-      totalEarned: firebase.firestore.FieldValue.increment(amount),
-      weeklyEarned: firebase.firestore.FieldValue.increment(amount)
-    });
+  if (window.db && window.firebaseFirestore) {
+    try {
+      const userRef = getDocRef('users', window.userData.userId);
+      await window.firebaseFirestore.updateDoc(userRef, {
+        totalEarned: window.firebaseFirestore.increment(amount),
+        weeklyEarned: window.firebaseFirestore.increment(amount)
+      });
+    } catch (error) {
+      console.error('Ошибка обновления статистики заработанного:', error);
+    }
   }
 }
 
 // Сброс недельного рейтинга (каждый понедельник)
 async function resetWeeklyIfNeeded() {
-  if (!window.userData || !window.db) return;
+  if (!window.userData || !window.db || !window.firebaseFirestore) return;
   
   try {
     const now = new Date();
-    const lastReset = window.userData.lastWeeklyReset?.toDate?.() || new Date(0);
+    let lastReset;
+    
+    // Обрабатываем Timestamp из модульного API
+    if (window.userData.lastWeeklyReset && typeof window.userData.lastWeeklyReset.toDate === 'function') {
+      lastReset = window.userData.lastWeeklyReset.toDate();
+    } else if (window.userData.lastWeeklyReset && window.userData.lastWeeklyReset.seconds) {
+      lastReset = new Date(window.userData.lastWeeklyReset.seconds * 1000);
+    } else {
+      lastReset = new Date(0);
+    }
+    
     const daysSinceReset = Math.floor((now - lastReset) / (1000 * 60 * 60 * 24));
     
     // Сбрасываем каждый понедельник (раз в 7 дней)
     if (daysSinceReset >= 7) {
-      await window.db.collection('users').doc(window.userData.userId).update({
+      const userRef = getDocRef('users', window.userData.userId);
+      await window.firebaseFirestore.updateDoc(userRef, {
         weeklyEarned: 0,
-        lastWeeklyReset: firebase.firestore.FieldValue.serverTimestamp()
+        lastWeeklyReset: window.firebaseFirestore.serverTimestamp()
       });
       
       window.userData.weeklyEarned = 0;
-      window.userData.lastWeeklyReset = firebase.firestore.FieldValue.serverTimestamp();
+      window.userData.lastWeeklyReset = window.firebaseFirestore.serverTimestamp();
       console.log('Недельный рейтинг сброшен');
     }
   } catch (error) {
@@ -661,15 +716,19 @@ async function resetWeeklyIfNeeded() {
 }
 
 // Загрузка глобального рейтинга
-async function loadGlobalLeaderboard(limit = 20) {
-  if (!window.db) return [];
+async function loadGlobalLeaderboard(limitCount = 20) {
+  if (!window.db || !window.firebaseFirestore) return [];
   
   try {
-    const usersSnapshot = await window.db.collection('users')
-      .where('leaderboardVisible', '==', true)
-      .orderBy('totalEarned', 'desc')
-      .limit(limit)
-      .get();
+    const usersCollection = getCollection('users');
+    const q = window.firebaseFirestore.query(
+      usersCollection,
+      window.firebaseFirestore.where('leaderboardVisible', '==', true),
+      window.firebaseFirestore.orderBy('totalEarned', 'desc'),
+      window.firebaseFirestore.limit(limitCount)
+    );
+    
+    const usersSnapshot = await window.firebaseFirestore.getDocs(q);
     
     const leaderboard = [];
     usersSnapshot.forEach(doc => {
@@ -695,9 +754,12 @@ async function loadGlobalLeaderboard(limit = 20) {
       
       // Fallback: загружаем всех видимых пользователей и сортируем на клиенте
       try {
-        const allUsersSnapshot = await window.db.collection('users')
-          .where('leaderboardVisible', '==', true)
-          .get();
+        const usersCollection = getCollection('users');
+        const q = window.firebaseFirestore.query(
+          usersCollection,
+          window.firebaseFirestore.where('leaderboardVisible', '==', true)
+        );
+        const allUsersSnapshot = await window.firebaseFirestore.getDocs(q);
         
         const leaderboard = [];
         allUsersSnapshot.forEach(doc => {
@@ -715,7 +777,7 @@ async function loadGlobalLeaderboard(limit = 20) {
         leaderboard.sort((a, b) => b.score - a.score);
         
         // Ограничиваем количество и добавляем ранги
-        return leaderboard.slice(0, limit).map((item, index) => ({
+        return leaderboard.slice(0, limitCount).map((item, index) => ({
           ...item,
           rank: index + 1
         }));
@@ -731,7 +793,7 @@ async function loadGlobalLeaderboard(limit = 20) {
 
 // Загрузка рейтинга друзей (из рефералов)
 async function loadFriendsLeaderboard() {
-  if (!window.userData || !window.db) return [];
+  if (!window.userData || !window.db || !window.firebaseFirestore) return [];
   
   const friends = [];
   
@@ -747,8 +809,9 @@ async function loadFriendsLeaderboard() {
   if (window.userData.referrals && window.userData.referrals.length > 0) {
     for (const friendId of window.userData.referrals) {
       try {
-        const friendDoc = await window.db.collection('users').doc(friendId).get();
-        if (friendDoc.exists) {
+        const friendRef = getDocRef('users', friendId);
+        const friendDoc = await window.firebaseFirestore.getDoc(friendRef);
+        if (friendDoc.exists()) {
           const data = friendDoc.data();
           friends.push({
             id: friendId,
@@ -769,18 +832,22 @@ async function loadFriendsLeaderboard() {
 }
 
 // Загрузка недельного рейтинга
-async function loadWeeklyLeaderboard(limit = 20) {
-  if (!window.db) return [];
+async function loadWeeklyLeaderboard(limitCount = 20) {
+  if (!window.db || !window.firebaseFirestore) return [];
   
   try {
     // Сначала сбросим старые недельные данные если нужно
     await resetWeeklyIfNeeded();
     
-    const usersSnapshot = await window.db.collection('users')
-      .where('leaderboardVisible', '==', true)
-      .orderBy('weeklyEarned', 'desc')
-      .limit(limit)
-      .get();
+    const usersCollection = getCollection('users');
+    const q = window.firebaseFirestore.query(
+      usersCollection,
+      window.firebaseFirestore.where('leaderboardVisible', '==', true),
+      window.firebaseFirestore.orderBy('weeklyEarned', 'desc'),
+      window.firebaseFirestore.limit(limitCount)
+    );
+    
+    const usersSnapshot = await window.firebaseFirestore.getDocs(q);
     
     const leaderboard = [];
     usersSnapshot.forEach(doc => {
@@ -805,9 +872,12 @@ async function loadWeeklyLeaderboard(limit = 20) {
       
       // Fallback: загружаем всех видимых пользователей и сортируем на клиенте
       try {
-        const allUsersSnapshot = await window.db.collection('users')
-          .where('leaderboardVisible', '==', true)
-          .get();
+        const usersCollection = getCollection('users');
+        const q = window.firebaseFirestore.query(
+          usersCollection,
+          window.firebaseFirestore.where('leaderboardVisible', '==', true)
+        );
+        const allUsersSnapshot = await window.firebaseFirestore.getDocs(q);
         
         const leaderboard = [];
         allUsersSnapshot.forEach(doc => {
@@ -824,7 +894,7 @@ async function loadWeeklyLeaderboard(limit = 20) {
         leaderboard.sort((a, b) => b.score - a.score);
         
         // Ограничиваем количество и добавляем ранги
-        return leaderboard.slice(0, limit).map((item, index) => ({
+        return leaderboard.slice(0, limitCount).map((item, index) => ({
           ...item,
           rank: index + 1
         }));
@@ -1033,56 +1103,115 @@ const firebaseConfig = {
   appId: "1:367826082536:web:be692072223caa20ed075d"
 };
 
-// Функция инициализации Firebase
-function initFirebase() {
+// Глобальные переменные для Firebase модулей
+window.firebaseApp = null;
+window.firebaseDb = null;
+window.firebaseFirestore = null;
+
+// Вспомогательные функции для работы с Firestore (модульный подход v9+)
+function getCollection(path) {
+  if (!window.db || !window.firebaseFirestore) {
+    throw new Error('Firestore не инициализирован');
+  }
+  return window.firebaseFirestore.collection(window.db, path);
+}
+
+function getDocRef(collectionPath, docId) {
+  if (!window.db || !window.firebaseFirestore) {
+    throw new Error('Firestore не инициализирован');
+  }
+  const col = window.firebaseFirestore.collection(window.db, collectionPath);
+  return window.firebaseFirestore.doc(col, docId);
+}
+
+// Функция инициализации Firebase (модульный подход v9+)
+async function initFirebase() {
   try {
-    // Проверяем, что Firebase SDK загружен
-    if (typeof firebase === 'undefined') {
-      console.error("❌ Firebase SDK не загружен");
-      console.error("Проверьте, что скрипты Firebase подключены в index.html");
-      throw new Error("Firebase SDK не загружен. Проверьте подключение скриптов в index.html");
-    }
+    console.log("🔧 Начало инициализации Firebase (модульный подход v9+)...");
     
-    // Проверяем наличие необходимых модулей
-    if (!firebase.firestore) {
-      console.error("❌ Firestore модуль не загружен");
-      throw new Error("Firestore модуль не загружен. Проверьте подключение firebase-firestore-compat.js");
-    }
+    // Динамический импорт Firebase модулей
+    const { initializeApp, getApps } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-app.js');
+    const { getFirestore, connectFirestoreEmulator } = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
     
+    // Импортируем все необходимые функции Firestore
+    const firestoreModule = await import('https://www.gstatic.com/firebasejs/10.7.0/firebase-firestore.js');
+    window.firebaseFirestore = firestoreModule;
+    
+    console.log("✅ Firebase модули загружены");
     console.log("Конфигурация Firebase:", {
       projectId: firebaseConfig.projectId,
       apiKey: firebaseConfig.apiKey ? firebaseConfig.apiKey.substring(0, 10) + '...' : 'не указан',
       authDomain: firebaseConfig.authDomain
     });
     
-    if (!firebase.apps || !firebase.apps.length) {
-      console.log("Инициализация нового Firebase приложения...");
-      const app = firebase.initializeApp(firebaseConfig);
-      window.db = firebase.firestore(); // NOT getFirestore(app)
-      console.log("✅ Firebase initialized successfully, app:", app.name);
+    // Проверяем, не инициализировано ли уже приложение
+    const existingApps = getApps();
+    if (existingApps.length > 0) {
+      console.log("⚠️ Firebase уже инициализирован, используем существующий экземпляр");
+      window.firebaseApp = existingApps[0];
     } else {
-      console.log("Firebase уже инициализирован, используем существующий экземпляр");
-      window.db = firebase.firestore(); // NOT getFirestore(app)
-      console.log("✅ Firebase already initialized");
+      console.log("🆕 Инициализация нового Firebase приложения...");
+      window.firebaseApp = initializeApp(firebaseConfig);
+      console.log("✅ Firebase приложение инициализировано:", window.firebaseApp.name);
     }
     
-    // Проверяем, что db был установлен
+    // Инициализируем Firestore
+    window.db = getFirestore(window.firebaseApp);
+    
+    // Проверяем, что db был создан
     if (!window.db) {
       console.error("❌ Firestore не был создан");
       throw new Error("Firestore не был создан. Проверьте конфигурацию Firebase.");
     }
     
-    // Пробуем выполнить простой запрос для проверки подключения
-    console.log("✅ Firestore создан успешно, db:", window.db);
+    console.log("✅ Firestore создан успешно");
+    
+    // Проверка подключения к Firestore
+    try {
+      console.log("🔍 Проверка подключения к Firestore...");
+      // Проверяем, что все необходимые функции доступны
+      const requiredFunctions = ['collection', 'doc', 'getDoc', 'setDoc', 'updateDoc', 'getDocs', 
+                                  'query', 'where', 'orderBy', 'limit', 'increment', 'serverTimestamp', 
+                                  'arrayUnion', 'Timestamp'];
+      const missingFunctions = requiredFunctions.filter(fn => !firestoreModule[fn]);
+      
+      if (missingFunctions.length > 0) {
+        console.warn("⚠️ Некоторые функции Firestore недоступны:", missingFunctions);
+      } else {
+        console.log("✅ Все функции Firestore доступны");
+      }
+      
+      console.log("✅ Проверка подключения завершена успешно");
+    } catch (connectionError) {
+      console.warn("⚠️ Предупреждение при проверке подключения:", connectionError);
+      // Не прерываем инициализацию, так как это может быть просто предупреждение
+    }
+    
+    console.log("✅ Firebase инициализация завершена успешно");
+    return true;
+    
   } catch (error) {
-    console.error("❌ Firebase initialization error:", error);
-    console.error("Детали ошибки инициализации:", {
+    console.error("❌ Ошибка инициализации Firebase:", error);
+    console.error("Детали ошибки:", {
       message: error.message,
       code: error.code,
+      name: error.name,
       stack: error.stack
     });
+    
+    // Дополнительная диагностика
+    if (error.message && error.message.includes('Failed to fetch')) {
+      console.error("⚠️ Проблема с загрузкой модулей Firebase. Проверьте:");
+      console.error("  1. Подключение к интернету");
+      console.error("  2. Доступность CDN Firebase");
+      console.error("  3. Блокировку скриптов браузером или расширениями");
+    }
+    
     window.db = null;
-    throw error; // Пробрасываем ошибку дальше
+    window.firebaseApp = null;
+    window.firebaseFirestore = null;
+    
+    throw error;
   }
 }
 
@@ -1390,18 +1519,24 @@ async function loadUserData() {
     
     try {
         // Проверяем подключение к Firestore перед выполнением запросов
-        if (!window.db || typeof window.db.collection !== 'function') {
+        if (!window.db || !window.firebaseFirestore) {
             throw new Error("Firestore не инициализирован или недоступен");
         }
         
         console.log("Подключение к Firestore, userId:", userInfo.userId);
-        const userRef = window.db.collection("users").doc(userInfo.userId);
+        const userRef = getDocRef("users", userInfo.userId);
         
         console.log("Выполнение запроса к Firestore...");
-        const userDoc = await userRef.get();
-        console.log("Запрос выполнен, документ существует:", userDoc.exists);
+        let userDoc;
+        try {
+            userDoc = await window.firebaseFirestore.getDoc(userRef);
+            console.log("Запрос выполнен, документ существует:", userDoc.exists());
+        } catch (queryError) {
+            console.error("❌ Ошибка выполнения запроса к Firestore:", queryError);
+            throw new Error(`Ошибка загрузки данных пользователя: ${queryError.message || queryError}`);
+        }
         
-        if (userDoc.exists) {
+        if (userDoc.exists()) {
             window.userData = userDoc.data();
             
             // Обновляем userId если его нет (для старых записей)
@@ -1455,7 +1590,7 @@ async function loadUserData() {
                 window.userData.leaderboardVisible = true;
             }
             if (!window.userData.lastWeeklyReset) {
-                window.userData.lastWeeklyReset = firebase.firestore.FieldValue.serverTimestamp();
+                window.userData.lastWeeklyReset = window.firebaseFirestore.serverTimestamp();
             }
             
             // Сбрасываем недельный рейтинг если нужно
@@ -1463,7 +1598,7 @@ async function loadUserData() {
             
             // Устанавливаем текущее время как последнее обновление если его нет
             if (!window.userData.lastEnergyUpdate) {
-                window.userData.lastEnergyUpdate = firebase.firestore.FieldValue.serverTimestamp();
+                window.userData.lastEnergyUpdate = window.firebaseFirestore.serverTimestamp();
             }
             
             // Пересчитываем статистику на основе всех улучшений
@@ -1474,7 +1609,7 @@ async function loadUserData() {
             
             // Восстанавливаем энергию на основе времени (БЕЗ перезаписи в БД здесь)
             // Функция updateEnergy() сама обновит энергию в БД если нужно
-            updateEnergy();
+            await updateEnergy();
             
             // Обновляем в Firestore (НО НЕ обновляем энергию - она уже обновлена в updateEnergy() или должна остаться из БД)
             const updateData = {
@@ -1493,11 +1628,16 @@ async function loadUserData() {
                 weeklyEarned: window.userData.weeklyEarned,
                 leaderboardVisible: window.userData.leaderboardVisible,
                 lastWeeklyReset: window.userData.lastWeeklyReset,
-                lastActive: firebase.firestore.FieldValue.serverTimestamp()
+                lastActive: window.firebaseFirestore.serverTimestamp()
             };
             
             // НЕ обновляем energy и lastEnergyUpdate здесь - они уже обновлены в updateEnergy() или должны остаться из БД
-            await userRef.update(updateData);
+            try {
+                await window.firebaseFirestore.updateDoc(userRef, updateData);
+            } catch (updateError) {
+                console.error("Ошибка обновления данных пользователя:", updateError);
+                // Не прерываем выполнение, так как данные уже загружены
+            }
             
             updateUI();
             renderShop(); // Обновляем магазин после загрузки данных
@@ -1539,40 +1679,45 @@ async function loadUserData() {
                 totalEarned: 0,
                 weeklyEarned: 0,
                 leaderboardVisible: true,
-                lastEnergyUpdate: firebase.firestore.FieldValue.serverTimestamp(),
-                lastWeeklyReset: firebase.firestore.FieldValue.serverTimestamp(),
-                createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-                lastActive: firebase.firestore.FieldValue.serverTimestamp()
+                lastEnergyUpdate: window.firebaseFirestore.serverTimestamp(),
+                lastWeeklyReset: window.firebaseFirestore.serverTimestamp(),
+                createdAt: window.firebaseFirestore.serverTimestamp(),
+                lastActive: window.firebaseFirestore.serverTimestamp()
             };
             
             // Пересчитываем статистику (для нового пользователя будет базовое значение)
             recalculateStats();
             
             // Создаем запись в базе данных
-            await userRef.set({
-                userId: userInfo.userId,
-                firstName: userInfo.firstName,
-                username: userInfo.username || '',
-                photoUrl: userInfo.photoUrl || '',
-                balance: 0,
-                totalClicks: 0,
-                perClickValue: window.userData.perClickValue,
-                passiveIncome: window.userData.passiveIncome,
-                upgrades: window.userData.upgrades,
-                referrals: [],
-                referralsEarned: 0,
-                invitedBy: null,
-                energy: 1000,
-                maxEnergy: 1000,
-                energyPerHour: 100,
-                lastEnergyUpdate: firebase.firestore.FieldValue.serverTimestamp(),
-                totalEarned: 0,
-                weeklyEarned: 0,
-                leaderboardVisible: true,
-                lastWeeklyReset: firebase.firestore.FieldValue.serverTimestamp(),
-                createdAt: firebase.firestore.FieldValue.serverTimestamp(),
-                lastActive: firebase.firestore.FieldValue.serverTimestamp()
-            });
+            try {
+                await window.firebaseFirestore.setDoc(userRef, {
+                    userId: userInfo.userId,
+                    firstName: userInfo.firstName,
+                    username: userInfo.username || '',
+                    photoUrl: userInfo.photoUrl || '',
+                    balance: 0,
+                    totalClicks: 0,
+                    perClickValue: window.userData.perClickValue,
+                    passiveIncome: window.userData.passiveIncome,
+                    upgrades: window.userData.upgrades,
+                    referrals: [],
+                    referralsEarned: 0,
+                    invitedBy: null,
+                    energy: 1000,
+                    maxEnergy: 1000,
+                    energyPerHour: 100,
+                    lastEnergyUpdate: window.firebaseFirestore.serverTimestamp(),
+                    totalEarned: 0,
+                    weeklyEarned: 0,
+                    leaderboardVisible: true,
+                    lastWeeklyReset: window.firebaseFirestore.serverTimestamp(),
+                    createdAt: window.firebaseFirestore.serverTimestamp(),
+                    lastActive: window.firebaseFirestore.serverTimestamp()
+                });
+            } catch (createError) {
+                console.error("Ошибка создания нового пользователя:", createError);
+                throw new Error(`Не удалось создать пользователя: ${createError.message || createError}`);
+            }
             
             console.log("✅ Новый пользователь создан в базе данных:", userInfo.userId);
             
@@ -1761,18 +1906,22 @@ async function handleClick() {
         }
         
         const userId = window.userData.userId.toString();
-        const userRef = window.db.collection('users').doc(userId);
+        const userRef = getDocRef('users', userId);
         
         // Тратим энергию
         window.userData.energy = Math.max(0, (window.userData.energy || 0) - 1);
         window.userData.energy = Math.floor(window.userData.energy); // Округляем до целых
         
         // Атомарное увеличение balance и totalClicks, уменьшение энергии
-        await userRef.update({
-            balance: firebase.firestore.FieldValue.increment(perClickValue),
-            totalClicks: firebase.firestore.FieldValue.increment(1),
-            energy: firebase.firestore.FieldValue.increment(-1),
-            lastActive: firebase.firestore.FieldValue.serverTimestamp()
+        if (!window.firebaseFirestore) {
+            throw new Error('Firebase Firestore модуль не загружен');
+        }
+        
+        await window.firebaseFirestore.updateDoc(userRef, {
+            balance: window.firebaseFirestore.increment(perClickValue),
+            totalClicks: window.firebaseFirestore.increment(1),
+            energy: window.firebaseFirestore.increment(-1),
+            lastActive: window.firebaseFirestore.serverTimestamp()
         });
         
         // Обновляем локальные данные
@@ -1780,7 +1929,7 @@ async function handleClick() {
         window.userData.totalClicks = (window.userData.totalClicks || 0) + 1;
         
         // Обновляем статистику заработанного
-        updateEarnedStats(perClickValue);
+        await updateEarnedStats(perClickValue);
         
         console.log("handleClick: После клика:", { 
             balance: window.userData.balance, 
@@ -1854,19 +2003,25 @@ function hideDevModeIndicator() {
 // Функция инициализации приложения
 async function initApp() {
     try {
-        // 1. Инициализация Firebase (compat версия)
-        // Используем функцию initFirebase(), которая проверяет, был ли Firebase уже инициализирован
+        // 1. Инициализация Firebase (модульный подход v9+)
         try {
-            initFirebase();
-            if (!window.db) {
+            await initFirebase();
+            if (!window.db || !window.firebaseFirestore) {
                 console.error("❌ Firestore не был инициализирован");
-                showError('Ошибка инициализации Firebase. Проверьте конфигурацию.');
+                showError('Ошибка инициализации Firebase. Проверьте конфигурацию и подключение к интернету.');
                 return;
             }
-            console.log("✅ Firebase initialized successfully, db:", window.db);
+            console.log("✅ Firebase initialized successfully");
+            console.log("✅ Firestore модуль загружен:", Object.keys(window.firebaseFirestore));
         } catch (error) {
             console.error("❌ Firebase error:", error);
-            showError('Ошибка инициализации Firebase. Проверьте конфигурацию.');
+            console.error("Детали ошибки:", {
+                message: error.message,
+                code: error.code,
+                name: error.name,
+                stack: error.stack
+            });
+            showError(`Ошибка инициализации Firebase: ${error.message || 'Проверьте конфигурацию и подключение к интернету.'}`);
             return;
         }
         
