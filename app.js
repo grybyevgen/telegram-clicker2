@@ -1594,19 +1594,64 @@ async function initFirebase() {
       
       console.log("✅ Firestore создан успешно");
       
-      // Проверка подключения к Firestore
+      // Явно включаем сеть для Firestore (важно для избежания ошибки "client is offline")
+      try {
+        const { enableNetwork, waitForPendingWrites } = firestoreModule;
+        console.log("🌐 Включение сети Firestore...");
+        await enableNetwork(window.db);
+        console.log("✅ Сеть Firestore включена");
+        
+        // Ждем завершения всех ожидающих записей
+        try {
+          await waitForPendingWrites(window.db);
+          console.log("✅ Все ожидающие записи завершены");
+        } catch (waitError) {
+          console.warn("⚠️ Предупреждение при ожидании записей:", waitError);
+        }
+      } catch (networkError) {
+        console.warn("⚠️ Не удалось включить сеть Firestore:", networkError);
+        // Продолжаем работу, но это может привести к проблемам
+      }
+      
+      // Проверка подключения к Firestore с реальным запросом
       try {
         console.log("🔍 Проверка подключения к Firestore...");
         // Проверяем, что все необходимые функции доступны
         const requiredFunctions = ['collection', 'doc', 'getDoc', 'setDoc', 'updateDoc', 'getDocs', 
                                     'query', 'where', 'orderBy', 'limit', 'increment', 'serverTimestamp', 
-                                    'arrayUnion', 'Timestamp'];
+                                    'arrayUnion', 'Timestamp', 'enableNetwork'];
         const missingFunctions = requiredFunctions.filter(fn => !firestoreModule[fn]);
         
         if (missingFunctions.length > 0) {
           console.warn("⚠️ Некоторые функции Firestore недоступны:", missingFunctions);
         } else {
           console.log("✅ Все функции Firestore доступны");
+        }
+        
+        // Пробуем выполнить простой запрос для проверки подключения
+        console.log("🔍 Выполнение тестового запроса...");
+        const testCollection = firestoreModule.collection(window.db, '_connection_test');
+        const testDoc = firestoreModule.doc(testCollection, 'test');
+        
+        // Пытаемся получить документ с таймаутом
+        const timeoutPromise = new Promise((_, reject) => 
+          setTimeout(() => reject(new Error('Timeout')), 5000)
+        );
+        
+        try {
+          await Promise.race([
+            firestoreModule.getDoc(testDoc),
+            timeoutPromise
+          ]);
+          console.log("✅ Тестовый запрос выполнен успешно - Firestore подключен");
+        } catch (testError) {
+          // Если документ не существует - это нормально, главное что запрос прошел
+          if (testError.code === 'not-found' || testError.message === 'Timeout') {
+            console.log("✅ Firestore подключен (тестовый документ не найден, но это нормально)");
+          } else {
+            console.warn("⚠️ Предупреждение при тестовом запросе:", testError);
+            // Не прерываем инициализацию, продолжаем работу
+          }
         }
         
         console.log("✅ Проверка подключения завершена успешно");
@@ -2119,6 +2164,19 @@ async function loadUserData() {
         }
         
         console.log("Подключение к Firestore, userId:", userInfo.userId);
+        
+        // Убеждаемся, что сеть включена перед запросом
+        if (window.firebaseFirestore.enableNetwork) {
+            try {
+                console.log("🌐 Проверка и включение сети Firestore...");
+                await window.firebaseFirestore.enableNetwork(window.db);
+                console.log("✅ Сеть Firestore активна");
+            } catch (networkError) {
+                console.warn("⚠️ Предупреждение при включении сети:", networkError);
+                // Продолжаем работу, возможно сеть уже включена
+            }
+        }
+        
         const userRef = getDocRef("users", userInfo.userId);
         
         console.log("Выполнение запроса к Firestore...");
@@ -2128,7 +2186,41 @@ async function loadUserData() {
             console.log("Запрос выполнен, документ существует:", userDoc.exists());
         } catch (queryError) {
             console.error("❌ Ошибка выполнения запроса к Firestore:", queryError);
-            throw new Error(`Ошибка загрузки данных пользователя: ${queryError.message || queryError}`);
+            
+            // Обработка ошибки "client is offline"
+            if (queryError.message && (
+                queryError.message.includes('client is offline') ||
+                queryError.message.includes('Failed to get document because the client is offline') ||
+                queryError.code === 'unavailable'
+            )) {
+                console.log("🔄 Обнаружена ошибка offline режима, пытаемся включить сеть...");
+                
+                // Пытаемся включить сеть и повторить запрос
+                if (window.firebaseFirestore.enableNetwork) {
+                    try {
+                        await window.firebaseFirestore.enableNetwork(window.db);
+                        console.log("✅ Сеть включена, повторная попытка запроса...");
+                        
+                        // Повторная попытка запроса
+                        userDoc = await window.firebaseFirestore.getDoc(userRef);
+                        console.log("✅ Повторный запрос выполнен успешно, документ существует:", userDoc.exists());
+                    } catch (retryError) {
+                        console.error("❌ Ошибка при повторной попытке:", retryError);
+                        // Если не удалось, переходим в offline режим
+                        window.offlineMode = true;
+                        updateConnectionStatus('offline');
+                        throw new Error(`Не удалось подключиться к Firestore. Работаем в offline режиме.`);
+                    }
+                } else {
+                    // Если enableNetwork недоступен, переходим в offline режим
+                    window.offlineMode = true;
+                    updateConnectionStatus('offline');
+                    throw new Error(`Firestore в offline режиме. Работаем локально.`);
+                }
+            } else {
+                // Другие ошибки
+                throw new Error(`Ошибка загрузки данных пользователя: ${queryError.message || queryError}`);
+            }
         }
         
         if (userDoc.exists()) {
@@ -2283,6 +2375,15 @@ async function loadUserData() {
             // Пересчитываем статистику (для нового пользователя будет базовое значение)
             recalculateStats();
             
+            // Убеждаемся, что сеть включена перед созданием пользователя
+            if (window.firebaseFirestore.enableNetwork) {
+                try {
+                    await window.firebaseFirestore.enableNetwork(window.db);
+                } catch (networkError) {
+                    console.warn("⚠️ Предупреждение при включении сети:", networkError);
+                }
+            }
+            
             // Создаем запись в базе данных
             try {
                 await window.firebaseFirestore.setDoc(userRef, {
@@ -2342,7 +2443,34 @@ async function loadUserData() {
             stack: error.stack
         });
         
-        // Более детальное сообщение об ошибке
+        // Проверяем, является ли это ошибкой offline режима
+        const isOfflineError = error.message && (
+            error.message.includes('client is offline') ||
+            error.message.includes('Failed to get document because the client is offline') ||
+            error.message.includes('Работаем в offline режиме') ||
+            error.message.includes('Работаем локально') ||
+            error.code === 'unavailable'
+        );
+        
+        if (isOfflineError) {
+            // Переходим в offline режим и загружаем данные из localStorage
+            console.log("📴 Переход в offline режим из-за ошибки подключения");
+            window.offlineMode = true;
+            updateConnectionStatus('offline');
+            
+            // Пытаемся загрузить данные из localStorage
+            try {
+                await loadUserDataOffline(userInfo);
+                return; // Выходим, так как данные загружены в offline режиме
+            } catch (offlineError) {
+                console.error("Ошибка загрузки данных в offline режиме:", offlineError);
+                showError('Не удалось загрузить данные. Проверьте подключение к интернету.');
+                hideLoading();
+                return;
+            }
+        }
+        
+        // Более детальное сообщение об ошибке для других случаев
         let errorMessage = 'Ошибка соединения с базой данных. ';
         if (error.code) {
             switch (error.code) {
